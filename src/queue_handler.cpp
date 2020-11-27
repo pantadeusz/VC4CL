@@ -9,6 +9,7 @@
 #include "Buffer.h"
 #include "Event.h"
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <deque>
@@ -19,30 +20,31 @@
 
 using namespace vc4cl;
 
-static std::deque<object_wrapper<Event>> eventBuffer;
-
 static const std::chrono::steady_clock::duration WAIT_DURATION =
     std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::milliseconds(10));
-// this is triggered after every finished cl_event
-static std::condition_variable eventProcessed;
-// this is triggered if a new event is available
-static std::condition_variable eventAvailable;
-static std::mutex listenMutex;
-static std::mutex bufferMutex;
-static std::mutex eventMutex;
 
-static std::mutex queuesMutex;
-static std::thread eventHandler;
-static cl_uint numCommandQueues;
+EventQueue::EventQueue() : continueRunning(true), eventHandler(std::bind(&EventQueue::runEventQueue, this))
+{
+    DEBUG_LOG(DebugLevel::EVENTS, std::cout << "Starting queue handler thread..." << std::endl);
+}
 
-void vc4cl::pushEventToQueue(Event* event)
+EventQueue::~EventQueue() noexcept
+{
+    DEBUG_LOG(DebugLevel::EVENTS, std::cout << "Stopping queue handler thread..." << std::endl)
+    continueRunning = false;
+    // wake up event handler, so we can stop it
+    eventAvailable.notify_all();
+    eventHandler.join();
+}
+
+void EventQueue::pushEvent(Event* event)
 {
     std::lock_guard<std::mutex> guard(bufferMutex);
     eventBuffer.emplace_back(object_wrapper<Event>{event});
     eventAvailable.notify_all();
 }
 
-Event* peekQueue()
+Event* EventQueue::peekQueue()
 {
     std::lock_guard<std::mutex> guard(bufferMutex);
     if(eventBuffer.empty())
@@ -50,7 +52,7 @@ Event* peekQueue()
     return eventBuffer.front().get();
 }
 
-void popFromEventQueue()
+void EventQueue::popFromEventQueue()
 {
     std::lock_guard<std::mutex> guard(bufferMutex);
     if(eventBuffer.empty())
@@ -58,7 +60,7 @@ void popFromEventQueue()
     eventBuffer.pop_front();
 }
 
-object_wrapper<Event> vc4cl::peekQueue(CommandQueue* queue)
+object_wrapper<Event> EventQueue::peek(CommandQueue* queue)
 {
     std::lock_guard<std::mutex> guard(bufferMutex);
 
@@ -70,7 +72,7 @@ object_wrapper<Event> vc4cl::peekQueue(CommandQueue* queue)
     return {};
 }
 
-void vc4cl::waitForEvent(const Event* event)
+void EventQueue::waitForEvent(const Event* event)
 {
     std::unique_lock<std::mutex> lock(listenMutex);
 
@@ -82,11 +84,18 @@ void vc4cl::waitForEvent(const Event* event)
     }
 }
 
-static void runEventQueue()
+std::shared_ptr<EventQueue> EventQueue::getInstance()
+{
+    // use a shared_ptr to make sure, the thread is only cleaned up after all command queues accessing it are deleted.
+    static std::shared_ptr<EventQueue> queue(new EventQueue());
+    return queue;
+}
+
+void EventQueue::runEventQueue()
 {
     // Sets the POSIX thread name
     prctl(PR_SET_NAME, "VC4CL Queue Handler", 0, 0, 0);
-    while(numCommandQueues != 0)
+    while(continueRunning)
     {
         Event* event = peekQueue();
         if(event)
@@ -157,35 +166,5 @@ static void runEventQueue()
             eventProcessed.notify_all();
         }
     }
-#ifdef DEBUG_MODE
-    LOG(std::cout << "Queue handler thread stopped" << std::endl)
-#endif
-}
-
-void vc4cl::initEventQueue()
-{
-    std::lock_guard<std::mutex> guard(queuesMutex);
-    numCommandQueues++;
-    if(!eventHandler.joinable())
-    {
-#ifdef DEBUG_MODE
-        LOG(std::cout << "Starting queue handler thread..." << std::endl)
-#endif
-        eventHandler = std::thread(runEventQueue);
-    }
-}
-
-void vc4cl::deinitEventQueue()
-{
-    std::lock_guard<std::mutex> guard(queuesMutex);
-    numCommandQueues--;
-    if(numCommandQueues == 0 && eventHandler.joinable())
-    {
-#ifdef DEBUG_MODE
-        LOG(std::cout << "Stopping queue handler thread..." << std::endl)
-#endif
-        // wake up event handler, so we can stop it
-        eventAvailable.notify_all();
-        eventHandler.join();
-    }
+    DEBUG_LOG(DebugLevel::EVENTS, std::cout << "Queue handler thread stopped" << std::endl)
 }

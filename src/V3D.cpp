@@ -18,16 +18,12 @@ using namespace vc4cl;
 
 static const uint32_t V3D_BASE_OFFSET = 0x00c00000;
 
-static std::unique_ptr<V3D> singleton;
-
 V3D::V3D()
 {
     bcm_host_init();
     v3dBasePointer = static_cast<uint32_t*>(
         mapmem(busAddressToPhysicalAddress(bcm_host_get_peripheral_address() + V3D_BASE_OFFSET), V3D_LENGTH));
-#ifdef DEBUG_MODE
-    std::cout << "[VC4CL] V3D base: " << v3dBasePointer << std::endl;
-#endif
+    DEBUG_LOG(DebugLevel::SYSCALL, std::cout << "[VC4CL] V3D base: " << v3dBasePointer << std::endl)
 }
 
 V3D::~V3D()
@@ -36,13 +32,10 @@ V3D::~V3D()
     bcm_host_deinit();
 }
 
-V3D& V3D::instance()
+std::shared_ptr<V3D>& V3D::instance()
 {
-    if(singleton == nullptr)
-    {
-        singleton.reset(new V3D());
-    }
-    return *singleton;
+    static std::shared_ptr<V3D> singleton(new V3D());
+    return singleton;
 }
 
 uint32_t V3D::getSystemInfo(const SystemInfo key) const
@@ -246,9 +239,7 @@ void* vc4cl::mapmem(unsigned base, unsigned size)
         throw std::system_error(errno, std::system_category(), "Failed to open /dev/mem");
     }
     void* mem = map_memory(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED /*|MAP_FIXED*/, mem_fd, base);
-#ifdef DEBUG_MODE
-    printf("[VC4CL] base=0x%x, mem=%p\n", base, mem);
-#endif
+    DEBUG_LOG(DebugLevel::SYSCALL, printf("[VC4CL] base=0x%x, mem=%p\n", base, mem))
     if(mem == MAP_FAILED)
     {
         std::cout << "[VC4CL] mmap error " << mem << std::endl;

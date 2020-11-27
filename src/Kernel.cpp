@@ -11,6 +11,8 @@
 #include "V3D.h"
 #include "extensions.h"
 
+#include <algorithm>
+
 using namespace vc4cl;
 
 extern cl_int executeKernel(KernelExecution&);
@@ -42,6 +44,16 @@ void ScalarArgument::addScalar(const int32_t s)
     scalarValues.push_back(v);
 }
 
+void ScalarArgument::addScalar(uint64_t l)
+{
+    ScalarValue lower;
+    lower.setUnsigned(static_cast<uint32_t>(l & 0xFFFFFFFF));
+    ScalarValue upper;
+    upper.setUnsigned(static_cast<uint32_t>(l >> 32));
+    scalarValues.push_back(lower);
+    scalarValues.push_back(upper);
+}
+
 std::string ScalarArgument::to_string() const
 {
     std::string res;
@@ -52,6 +64,11 @@ std::string ScalarArgument::to_string() const
     return res.substr(0, res.length() - 2);
 }
 
+std::unique_ptr<KernelArgument> ScalarArgument::clone() const
+{
+    return std::make_unique<ScalarArgument>(*this);
+}
+
 TemporaryBufferArgument::~TemporaryBufferArgument() noexcept = default;
 
 std::string TemporaryBufferArgument::to_string() const
@@ -59,11 +76,21 @@ std::string TemporaryBufferArgument::to_string() const
     return "temporary buffer" + (data.empty() ? "" : (" (with " + std::to_string(data.size()) + " bytes of data)"));
 }
 
+std::unique_ptr<KernelArgument> TemporaryBufferArgument::clone() const
+{
+    return std::make_unique<TemporaryBufferArgument>(*this);
+}
+
 BufferArgument::~BufferArgument() noexcept = default;
 
 std::string BufferArgument::to_string() const
 {
     return std::to_string(buffer ? static_cast<unsigned>(buffer->deviceBuffer->qpuPointer) : 0);
+}
+
+std::unique_ptr<KernelArgument> BufferArgument::clone() const
+{
+    return std::make_unique<BufferArgument>(*this);
 }
 
 Kernel::Kernel(Program* program, const KernelInfo& info) : program(program), info(info), argsSetMask(0)
@@ -75,14 +102,14 @@ Kernel::~Kernel() noexcept = default;
 
 cl_int Kernel::setArg(cl_uint arg_index, size_t arg_size, const void* arg_value)
 {
-#ifdef DEBUG_MODE
-    LOG(std::cout << "Set kernel arg " << arg_index << " for kernel '" << info.name << "' to " << arg_value << " ("
+    DEBUG_LOG(DebugLevel::KERNEL_EXECUTION,
+        std::cout << "Set kernel arg " << arg_index << " for kernel '" << info.name << "' to " << arg_value << " ("
                   << (arg_value == nullptr ? 0x0 : *reinterpret_cast<const int*>(arg_value)) << ") with size "
-                  << arg_size << std::endl)
-    LOG(std::cout << "Kernel arg " << arg_index << " for kernel '" << info.name << "' is "
+                  << arg_size << std::endl);
+    DEBUG_LOG(DebugLevel::KERNEL_EXECUTION,
+        std::cout << "Kernel arg " << arg_index << " for kernel '" << info.name << "' is "
                   << info.params[arg_index].type << " '" << info.params[arg_index].name << "' with size "
-                  << static_cast<size_t>(info.params[arg_index].getSize()) << std::endl)
-#endif
+                  << static_cast<size_t>(info.params[arg_index].getSize()) << std::endl);
 
     if(arg_index >= info.params.size())
     {
@@ -97,7 +124,17 @@ cl_int Kernel::setArg(cl_uint arg_index, size_t arg_size, const void* arg_value)
     if(!paramInfo.getPointer() || paramInfo.getByValue())
     {
         // literal (scalar, vector or struct) argument
-        if(arg_size != paramInfo.getSize())
+        if(paramInfo.getVectorElements() == 3 && arg_size * 4 == paramInfo.getSize() * 3)
+        {
+            /*
+             * pocl accepts size of base*3 and base*4 for base3 vectors. Standard seems not to say anything about that!
+             * See pocl/regression/test_vectors_as_args. Mesa only checks given size to be <= stored argument size, so
+             * it also accepts both base*3 and base*4 sizes...
+             */
+            // simply skipping the below check works, since below only the actually given (3-element) size is taken into
+            // account, not the stored (4-element) size.
+        }
+        else if(arg_size != paramInfo.getSize())
         {
             return returnError(CL_INVALID_ARG_SIZE, __FILE__, __LINE__,
                 buildString("Invalid arg size: %u, must be %d", arg_size, paramInfo.getSize()));
@@ -112,56 +149,71 @@ cl_int Kernel::setArg(cl_uint arg_index, size_t arg_size, const void* arg_value)
                     "Multiple vector elements for literal struct arguments are not supported");
             }
             args[arg_index].reset(new TemporaryBufferArgument(static_cast<unsigned>(arg_size), arg_value));
+            DEBUG_LOG(DebugLevel::KERNEL_EXECUTION,
+                std::cout << "Setting kernel-argument " << arg_index << " to temporary buffer "
+                          << args[arg_index]->to_string() << std::endl)
         }
-        const size_t elementSize = arg_size / paramInfo.getVectorElements();
-        ScalarArgument* scalarArg = new ScalarArgument(paramInfo.getVectorElements());
-        args[arg_index].reset(scalarArg);
-        for(cl_uchar i = 0; i < paramInfo.getVectorElements(); ++i)
+        else
         {
-            // arguments are all 32-bit, since UNIFORMS are always 32-bit
-            if(elementSize == 1 /* [u]char-types */)
+            size_t elementSize = arg_size / paramInfo.getVectorElements();
+            if(paramInfo.getVectorElements() == 3 && (arg_size % 3 != 0))
             {
-                // expand 8-bit to 32-bit
-                if(!paramInfo.getFloatingType() && paramInfo.getSigned())
+                // Fix-up for literal 3-element vectors when a 4-element vector (or at least a buffer holding up to 4
+                // elements) is passed in
+                elementSize = arg_size / 4;
+            }
+            ScalarArgument* scalarArg = new ScalarArgument(paramInfo.getVectorElements());
+            args[arg_index].reset(scalarArg);
+            for(cl_uchar i = 0; i < paramInfo.getVectorElements(); ++i)
+            {
+                // arguments are all 32-bit, since UNIFORMS are always 32-bit
+                if(elementSize == 1 /* [u]char-types */)
                 {
-                    cl_int tmp = static_cast<const cl_char*>(arg_value)[i];
-                    scalarArg->addScalar(tmp);
+                    // expand 8-bit to 32-bit
+                    if(!paramInfo.getFloatingType() && paramInfo.getSigned())
+                    {
+                        cl_int tmp = static_cast<const cl_char*>(arg_value)[i];
+                        scalarArg->addScalar(tmp);
+                    }
+                    else
+                    {
+                        cl_uint tmp = 0xFF & static_cast<const cl_uchar*>(arg_value)[i];
+                        scalarArg->addScalar(tmp);
+                    }
                 }
-                else
+                else if(elementSize == 2 /* [u]short-types, also half */)
                 {
-                    cl_uint tmp = 0xFF & static_cast<const cl_uchar*>(arg_value)[i];
-                    scalarArg->addScalar(tmp);
+                    // expand 16-bit to 32-bit
+                    if(!paramInfo.getFloatingType() && paramInfo.getSigned())
+                    {
+                        cl_int tmp = static_cast<const cl_short*>(arg_value)[i];
+                        scalarArg->addScalar(tmp);
+                    }
+                    else
+                    {
+                        cl_uint tmp = 0xFFFF & static_cast<const cl_ushort*>(arg_value)[i];
+                        scalarArg->addScalar(tmp);
+                    }
+                }
+                else if(elementSize == 8 /* [u]long */)
+                {
+                    scalarArg->addScalar(static_cast<const cl_ulong*>(arg_value)[i]);
+                }
+                else if(elementSize > 4)
+                {
+                    // not supported
+                    return returnError(
+                        CL_INVALID_ARG_SIZE, __FILE__, __LINE__, buildString("Invalid arg size: %u", arg_size));
+                }
+                else /* [u]int, float */
+                {
+                    scalarArg->addScalar(static_cast<const cl_uint*>(arg_value)[i]);
                 }
             }
-            else if(elementSize == 2 /* [u]short-types, also half */)
-            {
-                // expand 16-bit to 32-bit
-                if(!paramInfo.getFloatingType() && paramInfo.getSigned())
-                {
-                    cl_int tmp = static_cast<const cl_short*>(arg_value)[i];
-                    scalarArg->addScalar(tmp);
-                }
-                else
-                {
-                    cl_uint tmp = 0xFFFF & static_cast<const cl_ushort*>(arg_value)[i];
-                    scalarArg->addScalar(tmp);
-                }
-            }
-            else if(elementSize > 4)
-            {
-                // not supported
-                return returnError(
-                    CL_INVALID_ARG_SIZE, __FILE__, __LINE__, buildString("Invalid arg size: %u", arg_size));
-            }
-            else /* [u]int, float */
-            {
-                scalarArg->addScalar(static_cast<const cl_uint*>(arg_value)[i]);
-            }
+            DEBUG_LOG(DebugLevel::KERNEL_EXECUTION,
+                std::cout << "Setting kernel-argument " << arg_index << " to scalar " << args[arg_index]->to_string()
+                          << std::endl)
         }
-#ifdef DEBUG_MODE
-        LOG(std::cout << "Setting kernel-argument " << arg_index << " to scalar " << args[arg_index]->to_string()
-                      << std::endl)
-#endif
     }
     else
     {
@@ -219,16 +271,15 @@ cl_int Kernel::setArg(cl_uint arg_index, size_t arg_size, const void* arg_value)
             if(arg_size == 0)
                 return returnError(CL_INVALID_ARG_VALUE, __FILE__, __LINE__,
                     "The argument size for __local pointers must not be zero!");
-            if(arg_size > std::numeric_limits<unsigned>::max() || arg_size > mailbox().getTotalGPUMemory())
+            if(arg_size > std::numeric_limits<unsigned>::max() || arg_size > mailbox()->getTotalGPUMemory())
                 return returnError(CL_INVALID_ARG_VALUE, __FILE__, __LINE__,
                     "The argument size for __local pointers exceeds the supported maximum!");
             args[arg_index].reset(new TemporaryBufferArgument(static_cast<unsigned>(arg_size)));
         }
         else
             args[arg_index].reset(new BufferArgument(bufferArg));
-#ifdef DEBUG_MODE
-        LOG(std::cout << "Setting kernel-argument " << arg_index << " to pointer 0x" << bufferArg << std::endl)
-#endif
+        DEBUG_LOG(DebugLevel::KERNEL_EXECUTION,
+            std::cout << "Setting kernel-argument " << arg_index << " to pointer 0x" << bufferArg << std::endl)
     }
 
     argsSetMask.set(arg_index, true);
@@ -284,7 +335,7 @@ cl_int Kernel::getWorkGroupInfo(
     case CL_KERNEL_WORK_GROUP_SIZE:
         //"[...] query the maximum work-group size that can be used to execute a kernel on a specific device [...]"
         return returnValue<size_t>(
-            V3D::instance().getSystemInfo(SystemInfo::QPU_COUNT), param_value_size, param_value, param_value_size_ret);
+            V3D::instance()->getSystemInfo(SystemInfo::QPU_COUNT), param_value_size, param_value, param_value_size_ret);
     case CL_KERNEL_COMPILE_WORK_GROUP_SIZE:
         return returnValue(
             info.compileGroupSizes.data(), sizeof(size_t), 3, param_value_size, param_value, param_value_size_ret);
@@ -357,7 +408,7 @@ static bool split_compile_work_size(const std::array<std::size_t, kernel_config:
     if(compile_group_sizes[0] == 0 && compile_group_sizes[1] == 0 && compile_group_sizes[2] == 0)
         // no compile-time sizes set
         return false;
-    const cl_uint max_group_size = V3D::instance().getSystemInfo(SystemInfo::QPU_COUNT);
+    const cl_uint max_group_size = V3D::instance()->getSystemInfo(SystemInfo::QPU_COUNT);
 
     if((global_sizes[0] % compile_group_sizes[0]) != 0 || (global_sizes[1] % compile_group_sizes[1]) != 0 ||
         (global_sizes[2] % compile_group_sizes[2]) != 0)
@@ -384,7 +435,7 @@ static cl_int split_global_work_size(const std::array<std::size_t, kernel_config
     std::array<std::size_t, kernel_config::NUM_DIMENSIONS>& local_sizes, cl_uint num_dimensions)
 {
     const size_t total_sizes = global_sizes[0] * global_sizes[1] * global_sizes[2];
-    const cl_uint max_group_size = V3D::instance().getSystemInfo(SystemInfo::QPU_COUNT);
+    const cl_uint max_group_size = V3D::instance()->getSystemInfo(SystemInfo::QPU_COUNT);
     if(total_sizes <= max_group_size)
     {
         // can be executed in a single work-group
@@ -424,12 +475,11 @@ static cl_int split_global_work_size(const std::array<std::size_t, kernel_config
             if(local_sizes[0] * local_sizes[1] * local_sizes[2] <= max_group_size)
             {
                 // we found an acceptable distribution
-#ifdef DEBUG_MODE
-                LOG(std::cout << "Splitting " << global_sizes[0] << " * " << global_sizes[1] << " * " << global_sizes[2]
+                DEBUG_LOG(DebugLevel::KERNEL_EXECUTION,
+                    std::cout << "Splitting " << global_sizes[0] << " * " << global_sizes[1] << " * " << global_sizes[2]
                               << " work-items into " << local_sizes[0] << " * " << local_sizes[1] << " * "
                               << local_sizes[2] << ", using " << work_group_size << " of " << max_group_size << " QPUs"
                               << std::endl)
-#endif
                 return CL_SUCCESS;
             }
         }
@@ -537,10 +587,10 @@ cl_int Kernel::enqueueNDRange(CommandQueue* commandQueue, cl_uint work_dim, cons
                 work_sizes[2] + work_offsets[2], kernel_config::MAX_WORK_ITEM_DIMENSIONS[2]));
     }
     if(exceedsLimits<size_t>(
-           local_sizes[0] * local_sizes[1] * local_sizes[2], 1, V3D::instance().getSystemInfo(SystemInfo::QPU_COUNT)))
+           local_sizes[0] * local_sizes[1] * local_sizes[2], 1, V3D::instance()->getSystemInfo(SystemInfo::QPU_COUNT)))
         return returnError(CL_INVALID_WORK_GROUP_SIZE, __FILE__, __LINE__,
             buildString("Local work-sizes exceed maximum: %u * %u * %u > %u", local_sizes[0], local_sizes[1],
-                local_sizes[2], V3D::instance().getSystemInfo(SystemInfo::QPU_COUNT)));
+                local_sizes[2], V3D::instance()->getSystemInfo(SystemInfo::QPU_COUNT)));
 
     // check divisibility of local_sizes[i] by work_sizes[i]
     for(cl_uint i = 0; i < kernel_config::NUM_DIMENSIONS; ++i)
@@ -568,6 +618,10 @@ cl_int Kernel::enqueueNDRange(CommandQueue* commandQueue, cl_uint work_dim, cons
     source->globalOffsets = work_offsets;
     source->globalSizes = work_sizes;
     source->localSizes = local_sizes;
+    // need to clone the arguments to avoid race conditions
+    source->executionArguments.reserve(args.size());
+    std::transform(args.begin(), args.end(), std::back_inserter(source->executionArguments),
+        [](const auto& arg) { return arg->clone(); });
     source->tmpBuffers = std::move(tmpBuffers);
     source->persistentBuffers = std::move(persistentBuffers);
 
@@ -594,25 +648,38 @@ CHECK_RETURN cl_int Kernel::allocateAndTrackBufferArguments(
         const KernelArgument* arg = args.at(i).get();
         if(auto localArg = dynamic_cast<const TemporaryBufferArgument*>(arg))
         {
-            auto bufIt = tmpBuffers.emplace(i, mailbox().allocateBuffer(localArg->sizeToAllocate)).first;
-            if(!bufIt->second)
-                // failed to allocate the temporary buffer
-                return CL_OUT_OF_RESOURCES;
-            if(!localArg->data.empty())
+            if(info.params.at(i).getLowered())
             {
-                // copy the parameter values to the buffer
-                memcpy(bufIt->second->hostPointer, localArg->data.data(),
-                    std::min(static_cast<unsigned>(localArg->data.size()), localArg->sizeToAllocate));
+                // don't need to reserve temporary buffer, it will be unused anyway
+                // TODO the zeroing below is not applied for these parameters!
+                tmpBuffers.emplace(i, nullptr);
+                DEBUG_LOG(DebugLevel::KERNEL_EXECUTION,
+                    std::cout << "Skipping reserving of " << localArg->sizeToAllocate
+                              << " bytes of buffer for lowered local parameter: " << info.params.at(i).type << " "
+                              << info.params.at(i).name << std::endl)
             }
-            else if(program->context()->initializeMemoryToZero(CL_CONTEXT_MEMORY_INITIALIZE_LOCAL_KHR))
+            else
             {
-                // we need to initialize the local memory to zero
-                memset(bufIt->second->hostPointer, '\0', localArg->sizeToAllocate);
+                auto bufIt = tmpBuffers.emplace(i, mailbox()->allocateBuffer(localArg->sizeToAllocate)).first;
+                if(!bufIt->second)
+                    // failed to allocate the temporary buffer
+                    return CL_OUT_OF_RESOURCES;
+                if(!localArg->data.empty())
+                {
+                    // copy the parameter values to the buffer
+                    memcpy(bufIt->second->hostPointer, localArg->data.data(),
+                        std::min(static_cast<unsigned>(localArg->data.size()), localArg->sizeToAllocate));
+                }
+                else if(program->context()->initializeMemoryToZero(CL_CONTEXT_MEMORY_INITIALIZE_LOCAL_KHR))
+                {
+                    // we need to initialize the local memory to zero
+                    memset(bufIt->second->hostPointer, '\0', localArg->sizeToAllocate);
+                }
+                DEBUG_LOG(DebugLevel::KERNEL_EXECUTION,
+                    std::cout << "Reserved " << localArg->sizeToAllocate
+                              << " bytes of buffer for local/struct parameter: " << info.params.at(i).type << " "
+                              << info.params.at(i).name << std::endl)
             }
-#ifdef DEBUG_MODE
-            LOG(std::cout << "Reserved " << localArg->sizeToAllocate << " bytes of buffer for local/struct parameter: "
-                          << info.params.at(i).type << " " << info.params.at(i).name << std::endl)
-#endif
         }
     }
 
@@ -642,7 +709,10 @@ CHECK_RETURN cl_int Kernel::allocateAndTrackBufferArguments(
     return CL_SUCCESS;
 }
 
-KernelExecution::KernelExecution(Kernel* kernel) : kernel(kernel), numDimensions(0) {}
+KernelExecution::KernelExecution(Kernel* kernel) :
+    kernel(kernel), mailbox(vc4cl::mailbox()), v3d(V3D::instance()), numDimensions(0)
+{
+}
 KernelExecution::~KernelExecution() = default;
 
 cl_int KernelExecution::operator()()

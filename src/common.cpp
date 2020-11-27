@@ -5,6 +5,8 @@
  */
 
 #include "common.h"
+#include "extensions.h"
+#include "git_commit.h"
 
 #include <CL/opencl.h>
 
@@ -16,6 +18,11 @@
 #include <sys/prctl.h>
 
 using namespace vc4cl;
+
+// This is defined here to not need to include the git_commit.h header into the vc4cl_config.h header, since otherwise
+// we would always do an almost complete fully rebuild (since the git_commit.h header is always updated)
+const std::string platform_config::VERSION = std::string("OpenCL ") + platform_config::OPENCL_VERSION +
+    std::string(" VC4CL ") + platform_config::VC4CL_VERSION + (" (" GIT_COMMIT ")");
 
 std::string vc4cl::joinStrings(const std::vector<std::string>& strings, const std::string& delim)
 {
@@ -32,7 +39,7 @@ std::string vc4cl::joinStrings(const std::vector<std::string>& strings, const st
 cl_int vc4cl::returnValue(const void* value, const size_t value_size, const size_t value_count, size_t output_size,
     void* output, size_t* output_size_ret)
 {
-    if(output != nullptr)
+    if(output != nullptr && value != nullptr)
     {
         if(output_size < value_size * value_count)
             // not enough space on output parameter
@@ -74,6 +81,31 @@ CHECK_RETURN cl_int vc4cl::returnBuffers(const std::vector<void*>& buffers, cons
     return CL_SUCCESS;
 }
 
+cl_int vc4cl::returnExtensions(
+    const std::vector<Extension>& extensions, size_t output_size, void* output, size_t* output_size_ret)
+{
+    auto requiredSize = sizeof(cl_name_version_khr) * extensions.size();
+    if(output != nullptr)
+    {
+        if(output_size < requiredSize)
+            // not enough space on output parameter
+            return CL_INVALID_VALUE;
+        std::vector<cl_name_version_khr> items;
+        items.reserve(extensions.size());
+        for(const auto& ext : extensions)
+        {
+            cl_name_version_khr item{CL_MAKE_VERSION_KHR(ext.majorVersion, ext.minorVersion, 0), ""};
+            strncpy(item.name, ext.name.data(), CL_NAME_VERSION_MAX_NAME_SIZE_KHR);
+            items.emplace_back(std::move(item));
+        }
+        memcpy(output, items.data(), requiredSize);
+    }
+
+    if(output_size_ret != nullptr)
+        *output_size_ret = requiredSize;
+    return CL_SUCCESS;
+}
+
 static std::mutex logMutex;
 
 std::unique_lock<std::mutex> vc4cl::lockLog()
@@ -86,4 +118,35 @@ std::unique_lock<std::mutex> vc4cl::lockLog()
     std::unique_lock<std::mutex> lock(logMutex);
     std::cout << "[VC4CL](" << std::setfill(' ') << std::setw(15) << threadName << "): ";
     return lock;
+}
+
+static DebugLevel getDebugLevel()
+{
+    std::underlying_type<DebugLevel>::type level = 0;
+    if(auto env = std::getenv("VC4CL_DEBUG"))
+    {
+        std::string tmp(env);
+        if(tmp.find("api") != std::string::npos)
+            level |= static_cast<uint8_t>(DebugLevel::API_CALLS);
+        if(tmp.find("code") != std::string::npos)
+            level |= static_cast<uint8_t>(DebugLevel::DUMP_CODE);
+        if(tmp.find("syscall") != std::string::npos)
+            level |= static_cast<uint8_t>(DebugLevel::SYSCALL);
+        if(tmp.find("execution") != std::string::npos)
+            level |= static_cast<uint8_t>(DebugLevel::KERNEL_EXECUTION);
+        if(tmp.find("events") != std::string::npos)
+            level |= static_cast<uint8_t>(DebugLevel::EVENTS);
+        if(tmp.find("objects") != std::string::npos)
+            level |= static_cast<uint8_t>(DebugLevel::OBJECTS);
+        if(tmp.find("all") != std::string::npos)
+            level = static_cast<uint8_t>(DebugLevel::ALL);
+    }
+
+    return static_cast<DebugLevel>(level);
+}
+
+bool vc4cl::isDebugModeEnabled(DebugLevel level)
+{
+    static const auto debugLevel = getDebugLevel();
+    return (static_cast<uint8_t>(debugLevel) & static_cast<uint8_t>(level)) == static_cast<uint8_t>(level);
 }

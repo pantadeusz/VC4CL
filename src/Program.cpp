@@ -40,6 +40,7 @@ Program::Program(Context* context, const std::vector<char>& code, CreationType t
         sourceCode = code;
         break;
     case CreationType::INTERMEDIATE_LANGUAGE:
+    case CreationType::LIBRARY:
         intermediateCode.resize(code.size() / sizeof(uint8_t), '\0');
         if(!code.empty())
             memcpy(intermediateCode.data(), code.data(), code.size());
@@ -71,7 +72,7 @@ static cl_int extractLog(std::string& log, std::wstringstream& logStream)
     {
         std::vector<char> logTmp(numCharacters + 1 /* \0 byte */);
         numCharacters = std::wcstombs(logTmp.data(), logStream.str().data(), numCharacters);
-        log = std::string(logTmp.data(), numCharacters);
+        log.append(logTmp.data(), numCharacters);
     }
 
     return CL_SUCCESS;
@@ -81,27 +82,33 @@ static cl_int precompile_program(Program* program, const std::string& options,
     const std::unordered_map<std::string, object_wrapper<Program>>& embeddedHeaders)
 {
     std::istringstream sourceCode;
-    sourceCode.str(std::string(program->sourceCode.data(), program->sourceCode.size()));
+    // to avoid the warning about "null character ignored"
+    auto length = program->sourceCode.size();
+    if(length > 0 && program->sourceCode.back() == '\0')
+        --length;
+    sourceCode.str(std::string(program->sourceCode.data(), length));
 
     vc4c::SourceType sourceType = vc4c::Precompiler::getSourceType(sourceCode);
     if(sourceType == vc4c::SourceType::UNKNOWN || sourceType == vc4c::SourceType::QPUASM_BIN ||
         sourceType == vc4c::SourceType::QPUASM_HEX)
+    {
+        program->buildInfo.log.append("Invalid source-code type:");
+        program->buildInfo.log.append(program->sourceCode.data(), length);
         return returnError(
             CL_COMPILE_PROGRAM_FAILURE, __FILE__, __LINE__, buildString("Invalid source-code type %d", sourceType));
+    }
 
     vc4c::Configuration config;
 
     program->buildInfo.options = options;
-#ifdef DEBUG_MODE
-    LOG(std::cout << "Precompiling source with: " << program->buildInfo.options << std::endl)
-    {
+    DEBUG_LOG(DebugLevel::DUMP_CODE, {
+        std::cout << "Precompiling source with: " << program->buildInfo.options << std::endl;
         const std::string dumpFile("/tmp/vc4cl-source-" + std::to_string(rand()) + ".cl");
-        LOG(std::cout << "Dumping program sources to " << dumpFile << std::endl)
+        std::cout << "Dumping program sources to " << dumpFile << std::endl;
         std::ofstream f(dumpFile, std::ios_base::out | std::ios_base::trunc);
         f << sourceCode.str();
         f.close();
-    }
-#endif
+    })
 
     cl_int status = CL_SUCCESS;
     std::wstringstream logStream;
@@ -132,22 +139,36 @@ static cl_int precompile_program(Program* program, const std::string& options,
         uint8_t tmp;
         while(out->read(reinterpret_cast<char*>(&tmp), sizeof(uint8_t)))
             program->intermediateCode.push_back(tmp);
+
+        DEBUG_LOG(DebugLevel::DUMP_CODE, {
+            // reset the tmp buffer, so we can actually read from it again
+            out->clear();
+            out->seekg(0);
+            auto irType = vc4c::Precompiler::getSourceType(*out);
+            bool isSPIRVType = irType == vc4c::SourceType::SPIRV_BIN || irType == vc4c::SourceType::SPIRV_TEXT;
+            const std::string dumpFile("/tmp/vc4cl-ir-" + std::to_string(rand()) + (isSPIRVType ? ".spt" : ".ll"));
+            std::cout << "Dumping program IR to " << dumpFile << std::endl;
+            vc4c::Precompiler precomp(config, *out, irType);
+            std::unique_ptr<std::istream> irOut;
+            precomp.run(
+                irOut, isSPIRVType ? vc4c::SourceType::SPIRV_TEXT : vc4c::SourceType::LLVM_IR_TEXT, "", dumpFile);
+        })
     }
     catch(vc4c::CompilationError& e)
     {
-#ifdef DEBUG_MODE
-        LOG(std::cout << "Compilation error: " << e.what() << std::endl)
-#endif
+        DEBUG_LOG(DebugLevel::DUMP_CODE, std::cout << "Precompilation error: " << e.what() << std::endl)
+
+        program->buildInfo.log.append("Precompilation error:\n\t").append(e.what()).append("\n");
         status = CL_COMPILE_PROGRAM_FAILURE;
     }
     // copy log whether build failed or not
     extractLog(program->buildInfo.log, logStream);
 
-#ifdef DEBUG_MODE
-    LOG(std::cout << "Precompilation complete with status: " << status << std::endl)
-    if(!program->buildInfo.log.empty())
-        LOG(std::cout << "Compilation log: " << program->buildInfo.log << std::endl)
-#endif
+    DEBUG_LOG(DebugLevel::DUMP_CODE, {
+        std::cout << "Precompilation complete with status: " << status << std::endl;
+        if(!program->buildInfo.log.empty())
+            std::cout << "Compilation log: " << program->buildInfo.log << std::endl;
+    })
 
     return status;
 }
@@ -191,22 +212,37 @@ static cl_int link_programs(
         uint8_t tmp;
         while(linkedCode.read(reinterpret_cast<char*>(&tmp), sizeof(uint8_t)))
             program->intermediateCode.push_back(tmp);
+
+        DEBUG_LOG(DebugLevel::DUMP_CODE, {
+            // reset the tmp buffer, so we can actually read from it again
+            linkedCode.clear();
+            linkedCode.seekg(0);
+            auto irType = vc4c::Precompiler::getSourceType(linkedCode);
+            bool isSPIRVType = irType == vc4c::SourceType::SPIRV_BIN || irType == vc4c::SourceType::SPIRV_TEXT;
+            const std::string dumpFile("/tmp/vc4cl-ir-" + std::to_string(rand()) + (isSPIRVType ? ".spt" : ".ll"));
+            std::cout << "Dumping program IR to " << dumpFile << std::endl;
+            vc4c::Configuration dummyConfig{};
+            vc4c::Precompiler precomp(dummyConfig, linkedCode, irType);
+            std::unique_ptr<std::istream> irOut;
+            precomp.run(
+                irOut, isSPIRVType ? vc4c::SourceType::SPIRV_TEXT : vc4c::SourceType::LLVM_IR_TEXT, "", dumpFile);
+        })
     }
     catch(vc4c::CompilationError& e)
     {
-#ifdef DEBUG_MODE
-        LOG(std::cout << "Compilation error: " << e.what() << std::endl)
-#endif
+        DEBUG_LOG(DebugLevel::DUMP_CODE, std::cout << "Link error: " << e.what() << std::endl)
+
+        program->buildInfo.log.append("Link error:\n\t").append(e.what()).append("\n");
         status = CL_LINK_PROGRAM_FAILURE;
     }
     // copy log whether build failed or not
     extractLog(program->buildInfo.log, logStream);
 
-#ifdef DEBUG_MODE
-    LOG(std::cout << "Linking complete with status: " << status << std::endl)
-    if(!program->buildInfo.log.empty())
-        LOG(std::cout << "Compilation log: " << program->buildInfo.log << std::endl)
-#endif
+    DEBUG_LOG(DebugLevel::DUMP_CODE, {
+        std::cout << "Linking complete with status: " << status << std::endl;
+        if(!program->buildInfo.log.empty())
+            std::cout << "Compilation log: " << program->buildInfo.log << std::endl;
+    })
 
     return status;
 }
@@ -229,12 +265,10 @@ static cl_int compile_program(Program* program, const std::string& options)
      * NOTE: VC4 OpenGL driver disables the VPM user-memory completely
      * (see https://github.com/raspberrypi/linux/blob/rpi-4.9.y/drivers/gpu/drm/vc4/vc4_v3d.c #vc4_v3d_init_hw)
      */
-    config.availableVPMSize = V3D::instance().getSystemInfo(SystemInfo::VPM_MEMORY_SIZE);
+    config.availableVPMSize = V3D::instance()->getSystemInfo(SystemInfo::VPM_MEMORY_SIZE);
 
     program->buildInfo.options = options;
-#ifdef DEBUG_MODE
-    LOG(std::cout << "Compiling source with: " << program->buildInfo.options << std::endl)
-#endif
+    DEBUG_LOG(DebugLevel::DUMP_CODE, std::cout << "Compiling source with: " << program->buildInfo.options << std::endl)
 
     cl_int status = CL_SUCCESS;
     std::wstringstream logStream;
@@ -250,28 +284,27 @@ static cl_int compile_program(Program* program, const std::string& options)
     }
     catch(vc4c::CompilationError& e)
     {
-#ifdef DEBUG_MODE
-        LOG(std::cout << "Compilation error: " << e.what() << std::endl)
-#endif
+        DEBUG_LOG(DebugLevel::DUMP_CODE, std::cout << "Compilation error: " << e.what() << std::endl)
+
+        program->buildInfo.log.append("Compilation error:\n\t").append(e.what()).append("\n");
         status = CL_BUILD_PROGRAM_FAILURE;
     }
     // copy log whether build failed or not
     extractLog(program->buildInfo.log, logStream);
 
-#ifdef DEBUG_MODE
-    LOG(std::cout << "Compilation complete with status: " << status << std::endl)
-    if(!program->buildInfo.log.empty())
-    {
-        LOG(std::cout << "Compilation log: " << program->buildInfo.log << std::endl)
-    }
-    {
+    DEBUG_LOG(DebugLevel::DUMP_CODE, {
+        std::cout << "Compilation complete with status: " << status << std::endl;
+        if(!program->buildInfo.log.empty())
+        {
+            std::cout << "Compilation log: " << program->buildInfo.log << std::endl;
+        }
         const std::string dumpFile("/tmp/vc4cl-binary-" + std::to_string(rand()) + ".bin");
-        LOG(std::cout << "Dumping program sources to " << dumpFile << std::endl)
+        std::cout << "Dumping program binaries to " << dumpFile << std::endl;
         std::ofstream f(dumpFile, std::ios_base::out | std::ios_base::trunc | std::ios_base::binary);
-        f.write(reinterpret_cast<char*>(program->binaryCode.data()), program->binaryCode.size() * sizeof(uint64_t));
+        f.write(reinterpret_cast<char*>(program->binaryCode.data()),
+            static_cast<std::streamsize>(program->binaryCode.size() * sizeof(uint64_t)));
         f.close();
-    }
-#endif
+    })
 
     return status;
 }
@@ -313,12 +346,16 @@ cl_int Program::link(const std::string& options, const std::vector<object_wrappe
         // if the program is created from machine code, this is never called
         status = link_programs(this, programs, creationType == CreationType::INTERMEDIATE_LANGUAGE);
 
-        if(status == CL_SUCCESS)
+        if(status == CL_SUCCESS && creationType != CreationType::LIBRARY)
+            /*
+             * If we create a library, don't compile it to machine code yet, leave it as intermediate code.
+             * This is okay, since a library on its own has to be linked again into another program anyway to be useful.
+             */
             status = compile_program(this, options);
     }
 
     // extract kernel-info
-    if(status == CL_SUCCESS)
+    if(status == CL_SUCCESS && creationType != CreationType::LIBRARY)
     {
         // if the program was already compiled, clear all results
         moduleInfo.kernelInfos.clear();
@@ -426,8 +463,12 @@ cl_int Program::getBuildInfo(
         // the intermediate code is set, but the final code is not -> not yet linked
         // XXX for programs loaded via SPIR input (cl_khr_spir), need to return CL_PROGRAM_BINARY_TYPE_INTERMEDIATE here
         if(binaryCode.empty())
-            return returnValue<cl_program_binary_type>(
-                CL_PROGRAM_BINARY_TYPE_COMPILED_OBJECT, param_value_size, param_value, param_value_size_ret);
+        {
+            cl_program_binary_type type = creationType == CreationType::LIBRARY ?
+                CL_PROGRAM_BINARY_TYPE_LIBRARY :
+                CL_PROGRAM_BINARY_TYPE_COMPILED_OBJECT;
+            return returnValue<cl_program_binary_type>(type, param_value_size, param_value, param_value_size_ret);
+        }
         return returnValue<cl_program_binary_type>(
             CL_PROGRAM_BINARY_TYPE_EXECUTABLE, param_value_size, param_value, param_value_size_ret);
     }
@@ -1192,12 +1233,13 @@ cl_program VC4CL_FUNC(clLinkProgram)(cl_context context, cl_uint num_devices, co
     }
 
     // create a new empty program the result of the linking is inserted into
-    Program* newProgram =
-        newOpenCLObject<Program>(toType<Context>(context), std::vector<char>{}, CreationType::INTERMEDIATE_LANGUAGE);
+    const std::string opts(options == nullptr ? "" : options);
+    auto type =
+        opts.find("-create-library") == std::string::npos ? CreationType::INTERMEDIATE_LANGUAGE : CreationType::LIBRARY;
+    Program* newProgram = newOpenCLObject<Program>(toType<Context>(context), std::vector<char>{}, type);
     CHECK_ALLOCATION_ERROR_CODE(newProgram, errcode_ret, cl_program)
 
     newProgram->buildInfo.status = CL_BUILD_IN_PROGRESS;
-    const std::string opts(options == nullptr ? "" : options);
     if(pfn_notify)
     {
         // "If pfn_notify is not NULL, clLinkProgram does not need to wait for the linker to complete and can return

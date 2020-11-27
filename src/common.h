@@ -8,8 +8,10 @@
 
 #include "types.h"
 
+#include <array>
 #include <cstring>
 #include <exception>
+#include <functional>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -27,13 +29,50 @@ namespace vc4cl
 {
     std::unique_lock<std::mutex> lockLog();
 
-#define LOG(param)                                                                                                     \
+    /**
+     * The different modes/levels of debug output.
+     *
+     * This is a bitset allowing the fields to be combined.
+     */
+    enum class DebugLevel : uint8_t
+    {
+        NONE = 0,
+        // OpenCL API calls, parameters and return values (on error) are logged to the standard output
+        API_CALLS = 1u << 0u,
+        // OpenCL C, IR sources and VC4C binary output are dumped to temporary files
+        DUMP_CODE = 1u << 1u,
+        // Detailed information before and after syscalls (e.g. mailbox) is logged to the standard output
+        SYSCALL = 1u << 2u,
+        // Kernel execution, parameter and work-group information is logged to the standard output
+        KERNEL_EXECUTION = 1u << 3u,
+        // Event information is logged to the standard output
+        EVENTS = 1u << 4u,
+        // Lifetime information of OpenCL objects is logged to the standard output
+        OBJECTS = 1 << 5u,
+        ALL = 0xFF
+
+    };
+
+#define DEBUG_LOG(debugLevel, param)                                                                                   \
+    if(isDebugModeEnabled(debugLevel))                                                                                 \
     {                                                                                                                  \
         auto lock = lockLog();                                                                                         \
         param;                                                                                                         \
     }
 
+    bool isDebugModeEnabled(DebugLevel level);
+
     CHECK_RETURN std::string joinStrings(const std::vector<std::string>& strings, const std::string& delim = " ");
+
+    template <typename T, typename Func = std::function<std::string(const T&)>>
+    CHECK_RETURN std::string joinStrings(const std::vector<T>& objects, Func&& f, const std::string& delim = " ")
+    {
+        std::vector<std::string> strings;
+        strings.reserve(objects.size());
+        for(const auto& obj : objects)
+            strings.emplace_back(f(obj));
+        return joinStrings(strings, delim);
+    }
 
     CHECK_RETURN cl_int returnValue(const void* value, size_t value_size, size_t value_count, size_t output_size,
         void* output, size_t* output_size_ret);
@@ -41,6 +80,8 @@ namespace vc4cl
         const std::string& string, size_t output_size, void* output, size_t* output_size_ret);
     CHECK_RETURN cl_int returnBuffers(const std::vector<void*>& buffers, const std::vector<size_t>& sizes,
         size_t type_size, size_t output_size, void* output, size_t* output_size_ret);
+    CHECK_RETURN cl_int returnExtensions(
+        const std::vector<Extension>& extensions, size_t output_size, void* output, size_t* output_size_ret);
 
     template <typename T>
     CHECK_RETURN typename std::enable_if<std::is_arithmetic<T>::value | std::is_pointer<T>::value, cl_int>::type
@@ -54,10 +95,9 @@ namespace vc4cl
     CHECK_RETURN inline T returnError(
         cl_int error, cl_int* errcode_ret, const char* file, unsigned line, const std::string& reason)
     {
-#ifdef DEBUG_MODE
-        LOG(std::cout << "Error in '" << file << ":" << line << "', returning status " << error << ":" << reason
+        DEBUG_LOG(DebugLevel::API_CALLS,
+            std::cout << "Error in '" << file << ":" << line << "', returning status " << error << ": " << reason
                       << std::endl)
-#endif
         if(errcode_ret != nullptr)
             *errcode_ret = error;
         return nullptr;
@@ -65,33 +105,27 @@ namespace vc4cl
 
     CHECK_RETURN inline cl_int returnError(cl_int error, const char* file, unsigned line, const std::string& reason)
     {
-#ifdef DEBUG_MODE
-        LOG(std::cout << "Error in '" << file << ":" << line << "', returning status " << error << ":" << reason
+        DEBUG_LOG(DebugLevel::API_CALLS,
+            std::cout << "Error in '" << file << ":" << line << "', returning status " << error << ": " << reason
                       << std::endl)
-#endif
         return error;
     }
 
-#ifndef DEBUG_MODE
-    constexpr
-#endif
-        inline void
-        ignoreReturnValue(cl_int state, const char* file, unsigned line, const char* reasonForIgnoring)
+    inline void ignoreReturnValue(cl_int state, const char* file, unsigned line, const char* reasonForIgnoring)
     {
-    // used to hide warnings of unused return-values
-    // the reason is for documentation only
-#ifdef DEBUG_MODE
+        // used to hide warnings of unused return-values
+        // the reason is for documentation only
         if(state != CL_SUCCESS)
-            LOG(std::cout << "Error in '" << file << ":" << line << "', returning status " << state << std::endl);
-#endif
+            DEBUG_LOG(DebugLevel::API_CALLS,
+                std::cout << "Error in '" << file << ":" << line << "', returning status " << state << std::endl);
     }
 
     template <typename... T>
     CHECK_RETURN inline std::string buildString(const char* format, T... args)
     {
-        char tmp[4096];
-        int num = snprintf(tmp, 4096, format, std::forward<T>(args)...);
-        return std::string(tmp, static_cast<unsigned>(num));
+        std::array<char, 4096> tmp = {0};
+        int num = snprintf(tmp.data(), tmp.size(), format, std::forward<T>(args)...);
+        return std::string(tmp.data(), static_cast<unsigned>(num));
     }
 
     template <typename T, typename Src>
@@ -243,7 +277,7 @@ namespace vc4cl
     }
 
     template <typename T, typename... U>
-    std::ostream& printAPICallInternal(std::ostream& s, const char* const paramName, T param, U... args)
+    std::ostream& printAPICallInternal(std::ostream& s, const char* paramName, T param, U... args)
     {
         printAPICallInternal(s, paramName, param) << ", ";
         return printAPICallInternal(s, args...);
@@ -252,16 +286,8 @@ namespace vc4cl
     template <typename... T>
     inline void printAPICall(const char* const retType, const char* const funcName, T... args)
     {
-#ifdef DEBUG_MODE
-        static bool printAPICalls = true;
-#else
-        static bool printAPICalls = std::getenv("VC4CL_DEBUG") != nullptr;
-#endif
-        if(printAPICalls)
-        {
-            LOG(std::cout << "API call: " << retType << " " << funcName << "(";
-                printAPICallInternal(std::cout, args...) << ")" << std::endl)
-        }
+        DEBUG_LOG(DebugLevel::API_CALLS, std::cout << "API call: " << retType << " " << funcName << "(";
+                  printAPICallInternal(std::cout, args...) << ")" << std::endl)
     }
 
 #define VC4CL_PRINT_API_CALL(retType, funcName, ...) vc4cl::printAPICall(retType, #funcName, __VA_ARGS__)

@@ -55,7 +55,7 @@ bool TestExecutions::setup()
 	queue = VC4CL_FUNC(clCreateCommandQueue)(context, Platform::getVC4CLPlatform().VideoCoreIVGPU.toBase(), 0, &errcode);
 
 	return errcode == CL_SUCCESS && context != nullptr && queue != nullptr
-			&& V3D::instance().setCounter(COUNTER_IDLE, CounterType::IDLE_CYCLES) && V3D::instance().setCounter(COUNTER_EXECUTIONS, CounterType::EXECUTION_CYCLES);
+			&& V3D::instance()->setCounter(COUNTER_IDLE, CounterType::IDLE_CYCLES) && V3D::instance()->setCounter(COUNTER_EXECUTIONS, CounterType::EXECUTION_CYCLES);
 }
 
 void TestExecutions::testHungState()
@@ -64,15 +64,15 @@ void TestExecutions::testHungState()
 	//it is in a hung state (or another program is using it!)
 
 	//reset previous counter values
-	V3D::instance().resetCounterValue(COUNTER_IDLE);
-	V3D::instance().resetCounterValue(COUNTER_EXECUTIONS);
+	V3D::instance()->resetCounterValue(COUNTER_IDLE);
+	V3D::instance()->resetCounterValue(COUNTER_EXECUTIONS);
 
 	//wait some amount
 	std::this_thread::sleep_for(std::chrono::seconds{1});
 
 	//read new counter values
-	auto qpuIdle = static_cast<float>(V3D::instance().getCounter(COUNTER_IDLE));
-	auto qpuExec = static_cast<float>(V3D::instance().getCounter(COUNTER_EXECUTIONS));
+	auto qpuIdle = static_cast<float>(V3D::instance()->getCounter(COUNTER_IDLE));
+	auto qpuExec = static_cast<float>(V3D::instance()->getCounter(COUNTER_EXECUTIONS));
 
 	if(qpuIdle >= 0 && qpuExec >= 0 && (qpuIdle + qpuExec) > 0)
 	{
@@ -425,7 +425,6 @@ void TestExecutions::testBarrier()
 	TEST_ASSERT_EQUALS(9u, result.at(9));
 	TEST_ASSERT_EQUALS(10u, result.at(10));
 
-	//FIXME results as of second work-item are wrong!
 	TEST_ASSERT_EQUALS(0u, result.at(12));
 	TEST_ASSERT_EQUALS(1u, result.at(13));
 	TEST_ASSERT_EQUALS(2u, result.at(14));
@@ -678,8 +677,8 @@ void TestExecutions::tear_down()
 {
 	VC4CL_FUNC(clReleaseCommandQueue)(queue);
 	VC4CL_FUNC(clReleaseContext)(context);
-	V3D::instance().disableCounter(COUNTER_IDLE);
-	V3D::instance().disableCounter(COUNTER_EXECUTIONS);
+	V3D::instance()->disableCounter(COUNTER_IDLE);
+	V3D::instance()->disableCounter(COUNTER_EXECUTIONS);
 }
 
 void TestExecutions::buildProgram(cl_program* program, const std::string& fileName)

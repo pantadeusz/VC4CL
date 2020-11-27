@@ -49,6 +49,9 @@ namespace vc4cl
         SOURCE,
         // program was created from SPIR/SPIR-V IL
         INTERMEDIATE_LANGUAGE,
+        // fake a completely compiled library. This behaves mostly like INTERMEDIATE_LANGUAGE, but reports the library
+        // binary type
+        LIBRARY,
         // program was created from pre-compiled binary
         BINARY
     };
@@ -114,8 +117,10 @@ namespace vc4cl
         BITFIELD_ENTRY(ByValue, bool, 49, Bit)
 
         //// 2 Bits of decoration currently unused
-        //// 3 Bits unused
+        //// 2 Bits unused
 
+        // whether the parameter is lowered (e.g. into VPM) and does not need any (temporary) buffer allocated for it
+        BITFIELD_ENTRY(Lowered, bool, 54, Bit)
         // the parameter's address space, only valid for pointers
         // OpenCL default address space is "private"
         BITFIELD_ENTRY(AddressSpace, AddressSpace, 55, Quadruple)
@@ -218,7 +223,7 @@ namespace vc4cl
          * the program's intermediate code (e.g. SPIR or SPIR-V)
          * This code is pre-compiled, but not yet linked or compiled to QPU code
          *
-         * We choose single bytes, since we do not know the unit size of LLVM IR (SPIR-V hsa words of 32 bit)
+         * We choose single bytes, since we do not know the unit size of LLVM IR (SPIR-V has words of 32 bit)
          */
         std::vector<uint8_t> intermediateCode;
         // the machine-code, VC4C binary

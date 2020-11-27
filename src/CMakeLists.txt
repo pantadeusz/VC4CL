@@ -1,13 +1,19 @@
 add_library( VC4CL SHARED "")
 target_compile_definitions(VC4CL PUBLIC -DVC4CL_LIBRARY_VERSION="${PROJECT_VERSION}")
-target_include_directories(VC4CL PUBLIC ${OpenCL_INCLUDE_DIRS})
+if(OpenCL_FOUND)
+	# OpenCL was included via the default find_package() and therefore is already installed
+	target_include_directories(VC4CL SYSTEM PUBLIC ${OpenCL_INCLUDE_DIRS})
+else()
+	# support for custom OpenCL headers for build and system headers after installation
+	get_filename_component(OPENCL_HEADERS ${OpenCL_INCLUDE_DIRS} ABSOLUTE ${CMAKE_BINARY_DIR})
+	target_include_directories(VC4CL PUBLIC
+	    $<BUILD_INTERFACE:${OPENCL_HEADERS}>
+	    $<INSTALL_INTERFACE:include>  # <prefix>/include/mylib
+	)
+endif()
 
 # append usage of C++ to compiler flags, also optimize for speed and enable all warnings
 target_compile_options(VC4CL PRIVATE ${VC4CL_ENABLED_WARNINGS})
-
-if(BUILD_DEBUG)
-	target_compile_definitions(VC4CL PRIVATE DEBUG_MODE=1)
-endif(BUILD_DEBUG)
 
 # Add all sources
 include(sources.list)
@@ -18,12 +24,15 @@ if(INCLUDE_COMPILER AND EXISTS "${VC4C_HEADER_PATH}")
 endif()
 
 if(MOCK_HAL)
-	target_compile_definitions(VC4CL PRIVATE -DMOCK_HAL=1)
+	target_compile_definitions(VC4CL PRIVATE MOCK_HAL=1)
 elseif(CROSS_COMPILE OR EXISTS "/opt/vc/include/bcm_host.h")
 	find_library(BCMHOST_LIBRARY NAMES bcm_host libbcm_host HINTS "/opt/vc/lib")
 	target_link_libraries(VC4CL ${BCMHOST_LIBRARY} ${SYSROOT_LIBRARY_FLAGS})
 endif()
-
+if(ENABLE_COVERAGE)
+	target_compile_options(VC4CL PRIVATE -fprofile-arcs -ftest-coverage --coverage)
+	target_link_libraries(VC4CL gcov "-fprofile-arcs -ftest-coverage")
+endif(ENABLE_COVERAGE)
 if(CROSS_COMPILE)
 	target_link_libraries(VC4CL rt ${SYSROOT_LIBRARY_FLAGS})
 endif()
@@ -33,7 +42,7 @@ if(BUILD_ICD)
 	target_compile_definitions(VC4CL PUBLIC -Dcl_khr_icd=1 -Duse_cl_khr_icd=1)
 
 	if(NOT CROSS_COMPILE)
-		target_include_directories(VC4CL PRIVATE ${OCL_ICD_INCLUDEDIR})
+		target_include_directories(VC4CL SYSTEM PRIVATE ${OCL_ICD_INCLUDEDIR})
 	endif()
 endif()
 
@@ -56,7 +65,7 @@ set_target_properties(
 
 find_program(
 	CLANG_FORMAT_PATH
-	NAMES clang-format clang-format-3.8 clang-format-3.9 clang-format-4.0
+	NAMES clang-format clang-format-3.8 clang-format-3.9 clang-format-4.0 clang-format-5.0 clang-format-6.0 clang-format-7 clang-format-8 clang-format-9
 	HINTS "/usr/bin" "/usr/local/bin"
 )
 
@@ -73,6 +82,18 @@ if(CLANG_FORMAT_PATH)
 else()
   message (WARNING "clang-format not found: strongly recommend to use it before commit!")
 endif()
+
+##
+# Git commit in the version string
+##
+add_custom_target(GetGitCommit
+	# If the git command fails, write dummy content (e.g. when not on a git repository)
+	COMMAND git log -1 "--format=#define GIT_COMMIT \"%h\"" > ./git_commit.h || echo "#define GIT_COMMIT \"unknown\"" > ./git_commit.h
+	WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+	VERBATIM
+)
+target_include_directories(VC4CL PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+add_dependencies(VC4CL GetGitCommit)
 
 ##
 # Installation targets

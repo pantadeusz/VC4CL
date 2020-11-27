@@ -48,15 +48,17 @@ using namespace vc4cl;
 #define IOCTL_MBOX_PROPERTY _IOWR(MAJOR_NUM, 0, char*)
 #define DEVICE_FILE_NAME "/dev/vcio"
 
-DeviceBuffer::DeviceBuffer(uint32_t handle, DevicePointer devPtr, void* hostPtr, uint32_t size) :
-    memHandle(handle), qpuPointer(devPtr), hostPointer(hostPtr), size(size)
+DeviceBuffer::DeviceBuffer(
+    const std::shared_ptr<Mailbox>& mb, uint32_t handle, DevicePointer devPtr, void* hostPtr, uint32_t size) :
+    memHandle(handle),
+    qpuPointer(devPtr), hostPointer(hostPtr), size(size), mailbox(mb)
 {
 }
 
 DeviceBuffer::~DeviceBuffer()
 {
     if(memHandle != 0)
-        mailbox().deallocateBuffer(this);
+        mailbox->deallocateBuffer(this);
 }
 
 void DeviceBuffer::dumpContent() const
@@ -83,9 +85,7 @@ static int mbox_open()
                   << " 0" << std::endl;
         throw std::system_error(errno, std::system_category(), "Failed to open mailbox");
     }
-#ifdef DEBUG_MODE
-    std::cout << "[VC4CL] Mailbox file descriptor opened: " << file_desc << std::endl;
-#endif
+    DEBUG_LOG(DebugLevel::SYSCALL, std::cout << "[VC4CL] Mailbox file descriptor opened: " << file_desc << std::endl)
     return file_desc;
 }
 
@@ -100,12 +100,10 @@ Mailbox::~Mailbox()
     ignoreReturnValue(enableQPU(false) ? CL_SUCCESS : CL_OUT_OF_RESOURCES, __FILE__, __LINE__,
         "There is no way of handling an error here");
     close_mailbox(fd);
-#ifdef DEBUG_MODE
-    std::cout << "[VC4CL] Mailbox file descriptor closed: " << fd << std::endl;
-#endif
+    DEBUG_LOG(DebugLevel::SYSCALL, std::cout << "[VC4CL] Mailbox file descriptor closed: " << fd << std::endl)
 }
 
-DeviceBuffer* Mailbox::allocateBuffer(unsigned sizeInBytes, unsigned alignmentInBytes, MemoryFlag flags) const
+DeviceBuffer* Mailbox::allocateBuffer(unsigned sizeInBytes, unsigned alignmentInBytes, MemoryFlag flags)
 {
     // munmap requires an alignment of the system page size (4096), so we need to enforce it here
     unsigned handle = memAlloc(sizeInBytes, std::max(static_cast<unsigned>(PAGE_ALIGNMENT), alignmentInBytes), flags);
@@ -113,11 +111,10 @@ DeviceBuffer* Mailbox::allocateBuffer(unsigned sizeInBytes, unsigned alignmentIn
     {
         DevicePointer qpuPointer = memLock(handle);
         void* hostPointer = mapmem(V3D::busAddressToPhysicalAddress(static_cast<unsigned>(qpuPointer)), sizeInBytes);
-#ifdef DEBUG_MODE
-        LOG(std::cout << "Allocated " << sizeInBytes << " bytes of buffer: handle " << handle << ", device address "
+        DEBUG_LOG(DebugLevel::SYSCALL,
+            std::cout << "Allocated " << sizeInBytes << " bytes of buffer: handle " << handle << ", device address "
                       << std::hex << "0x" << qpuPointer << ", host address " << hostPointer << std::dec << std::endl)
-#endif
-        return new DeviceBuffer(handle, qpuPointer, hostPointer, sizeInBytes);
+        return new DeviceBuffer(shared_from_this(), handle, qpuPointer, hostPointer, sizeInBytes);
     }
     return nullptr;
 }
@@ -132,11 +129,10 @@ bool Mailbox::deallocateBuffer(const DeviceBuffer* buffer) const
             return false;
         if(!memFree(buffer->memHandle))
             return false;
-#ifdef DEBUG_MODE
-        LOG(std::cout << "Deallocated " << buffer->size << " bytes of buffer: handle " << buffer->memHandle
+        DEBUG_LOG(DebugLevel::SYSCALL,
+            std::cout << "Deallocated " << buffer->size << " bytes of buffer: handle " << buffer->memHandle
                       << ", device address " << std::hex << "0x" << buffer->qpuPointer << ", host address "
                       << buffer->hostPointer << std::dec << std::endl)
-#endif
     }
     return true;
 }
@@ -156,10 +152,9 @@ ExecutionHandle Mailbox::executeQPU(unsigned numQPUs, std::pair<uint32_t*, uint3
 {
     if(timeout.count() > 0xFFFFFFFF)
     {
-#ifdef DEBUG_MODE
-        LOG(std::cout << "Timeout is too big, needs fit into a 32-bit integer: " << timeout.count() << std::endl)
-        return false;
-#endif
+        DEBUG_LOG(DebugLevel::SYSCALL,
+            std::cout << "Timeout is too big, needs fit into a 32-bit integer: " << timeout.count() << std::endl)
+        return ExecutionHandle{false};
     }
     /*
      * "By default the qpu_execute call does a GPU side L1 and L2 data cache flush before executing the qpu code. If you
@@ -186,27 +181,29 @@ uint32_t Mailbox::getTotalGPUMemory() const
  */
 int Mailbox::mailboxCall(void* buffer) const
 {
-#ifdef DEBUG_MODE
     unsigned* p = reinterpret_cast<unsigned*>(buffer);
     unsigned size = *p;
-    LOG(std::cout << "Mailbox buffer before:"; for(unsigned i = 0; i < size / 4; ++i) std::cout
-        << ' ' << std::hex << std::setfill('0') << std::setw(8) << p[i] << std::dec;
-        std::cout << std::endl)
-#endif
+    DEBUG_LOG(DebugLevel::SYSCALL, {
+        std::cout << "Mailbox buffer before:";
+        for(unsigned i = 0; i < size / 4; ++i)
+            std::cout << ' ' << std::hex << std::setfill('0') << std::setw(8) << p[i] << std::dec;
+        std::cout << std::endl;
+    })
 
     int ret_val = ioctl_mailbox(fd, IOCTL_MBOX_PROPERTY, buffer);
     if(ret_val < 0)
     {
-        LOG(std::cout << "ioctl_set_msg failed: " << ret_val << std::endl)
+        DEBUG_LOG(DebugLevel::SYSCALL, std::cout << "ioctl_set_msg failed: " << ret_val << std::endl)
         perror("[VC4CL] Error in mbox_property");
         throw std::system_error(errno, std::system_category(), "Failed to set mailbox property");
     }
 
-#ifdef DEBUG_MODE
-    LOG(std::cout << "Mailbox buffer after:"; for(unsigned i = 0; i < size / 4; ++i) std::cout
-        << ' ' << std::hex << std::setfill('0') << std::setw(8) << p[i] << std::dec;
-        std::cout << std::endl)
-#endif
+    DEBUG_LOG(DebugLevel::SYSCALL, {
+        std::cout << "Mailbox buffer after:";
+        for(unsigned i = 0; i < size / 4; ++i)
+            std::cout << ' ' << std::hex << std::setfill('0') << std::setw(8) << p[i] << std::dec;
+        std::cout << std::endl;
+    })
     return ret_val;
 }
 
@@ -260,28 +257,21 @@ CHECK_RETURN bool Mailbox::checkReturnValue(unsigned value) const
 {
     if((value >> 31) == 1) // 0x8000000x
     {
-    // 0x80000000 on success
-    // 0x80000001 on failure
-#ifdef DEBUG_MODE
-        LOG(std::cout << "Mailbox request: " << (((value & 0x1) == 0x1) ? "failed" : "succeeded") << std::endl)
-#endif
+        // 0x80000000 on success
+        // 0x80000001 on failure
+        DEBUG_LOG(DebugLevel::SYSCALL,
+            std::cout << "Mailbox request: " << (((value & 0x1) == 0x1) ? "failed" : "succeeded") << std::endl)
         return value == 0x80000000;
     }
     else
     {
-#ifdef DEBUG_MODE
-        LOG(std::cout << "Unknown return code: " << value << std::endl)
-#endif
+        DEBUG_LOG(DebugLevel::SYSCALL, std::cout << "Unknown return code: " << value << std::endl)
         return false;
     }
 }
 
-// to prevent race-conditions on initialization
-static std::once_flag mailboxInitialized;
-static std::unique_ptr<Mailbox> mb;
-
-Mailbox& vc4cl::mailbox()
+std::shared_ptr<Mailbox>& vc4cl::mailbox()
 {
-    std::call_once(mailboxInitialized, []() -> void { mb = std::make_unique<Mailbox>(); });
-    return *mb;
+    static std::shared_ptr<Mailbox> mb(new Mailbox());
+    return mb;
 }

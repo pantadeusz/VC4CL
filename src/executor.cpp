@@ -39,9 +39,10 @@ static unsigned AS_GPU_ADDRESS(const unsigned* ptr, DeviceBuffer* buffer)
         static_cast<uint32_t>(buffer->qpuPointer) + ((tmp) - reinterpret_cast<char*>(buffer->hostPointer)));
 }
 
-static size_t get_size(size_t code_size, size_t num_uniforms, size_t global_data_size, size_t stackFrameSizeInWords)
+static size_t get_size(const std::shared_ptr<V3D>& v3d, size_t code_size, size_t num_uniforms, size_t global_data_size,
+    size_t stackFrameSizeInWords)
 {
-    auto numQPUS = V3D::instance().getSystemInfo(SystemInfo::QPU_COUNT);
+    auto numQPUS = v3d->getSystemInfo(SystemInfo::QPU_COUNT);
 
     // we duplicate the UNIFORMs to be able to update one block while the second one is used for execution
     size_t uniformSize = 2 * sizeof(unsigned) * num_uniforms;
@@ -62,8 +63,8 @@ static unsigned* set_work_item_info(unsigned* ptr, cl_uint num_dimensions,
     const std::array<std::size_t, kernel_config::NUM_DIMENSIONS>& local_indices, unsigned global_data,
     unsigned uniformAddress, const KernelUniforms& uniformsUsed)
 {
-#ifdef DEBUG_MODE
-    LOG(std::cout << "Setting work-item infos:" << std::endl;
+    DEBUG_LOG(DebugLevel::KERNEL_EXECUTION, {
+        std::cout << "Setting work-item infos:" << std::endl;
         std::cout << "\t" << num_dimensions << " dimensions with offsets: " << global_offsets[0] << ", "
                   << global_offsets[1] << ", " << global_offsets[2] << std::endl;
         std::cout << "\tGlobal IDs (sizes): " << group_indices[0] * local_sizes[0] + local_indices[0] << "("
@@ -74,8 +75,8 @@ static unsigned* set_work_item_info(unsigned* ptr, cl_uint num_dimensions,
                   << "(" << local_sizes[1] << "), " << local_indices[2] << "(" << local_sizes[2] << ")" << std::endl;
         std::cout << "\tGroup IDs (sizes): " << group_indices[0] << "(" << (global_sizes[0] / local_sizes[0]) << "), "
                   << group_indices[1] << "(" << (global_sizes[1] / local_sizes[1]) << "), " << group_indices[2] << "("
-                  << (global_sizes[2] / local_sizes[2]) << ")" << std::endl)
-#endif
+                  << (global_sizes[2] / local_sizes[2]) << ")" << std::endl;
+    })
     // composes UNIFORMS for the values
     if(uniformsUsed.getWorkDimensionsUsed())
         *ptr++ = num_dimensions; /* get_work_dim() */
@@ -127,11 +128,12 @@ static bool increment_index(std::array<std::size_t, kernel_config::NUM_DIMENSION
     return indices[2] < limits[2];
 }
 
-static ExecutionHandle executeQPU(unsigned numQPUs, std::pair<uint32_t*, unsigned> controlAddress, bool flushBuffer,
+static ExecutionHandle executeQPU(const std::shared_ptr<Mailbox>& mailbox, const std::shared_ptr<V3D>& v3d,
+    unsigned numQPUs, std::pair<uint32_t*, unsigned> controlAddress, bool flushBuffer,
     std::chrono::milliseconds timeout)
 {
 #ifdef REGISTER_POKE_KERNELS
-    return V3D::instance().executeQPU(numQPUs, controlAddress, flushBuffer, timeout);
+    return v3d->executeQPU(numQPUs, controlAddress, flushBuffer, timeout);
 #else
     if(!flushBuffer)
         /*
@@ -143,18 +145,89 @@ static ExecutionHandle executeQPU(unsigned numQPUs, std::pair<uint32_t*, unsigne
          */
         // TODO test with less delay? hangs? works? better performance?
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    return mailbox().executeQPU(numQPUs, controlAddress, flushBuffer, timeout);
+    return mailbox->executeQPU(numQPUs, controlAddress, flushBuffer, timeout);
 #endif
+}
+
+static void dumpBuffer(std::ostream& os, const DeviceBuffer* buffer)
+{
+    if(!buffer)
+    {
+        uint32_t numWords = 1;
+        os.write(reinterpret_cast<char*>(&numWords), sizeof(unsigned));
+        uint32_t address = 0;
+        os.write(reinterpret_cast<char*>(&address), sizeof(unsigned));
+    }
+    else
+    {
+        // TODO for sub-buffers, the address and contents of the whole buffer is dumped
+        uint32_t numWords = 0x80000000 | static_cast<uint32_t>(buffer->size / sizeof(unsigned));
+        os.write(reinterpret_cast<char*>(&numWords), sizeof(unsigned));
+        os.write(reinterpret_cast<const char*>(buffer->hostPointer), buffer->size);
+    }
+}
+
+static void dumpMemoryState(std::ostream& os, const Kernel* kernel, const KernelExecution& args,
+    DeviceBuffer& mainBuffer, const uint32_t* qpu_code, uint32_t* firstUniformPointer, bool printHead)
+{
+    // add additional pointers for the dump-analyzer
+    // qpu base-pointer (global-data pointer) | qpu code-pointer | qpu UNIFORM-pointer | num uniforms
+    // | implicit uniform bit-field
+    if(printHead)
+    {
+        unsigned tmp = static_cast<unsigned>(mainBuffer.qpuPointer);
+        os.write(reinterpret_cast<char*>(&tmp), sizeof(unsigned));
+        tmp = AS_GPU_ADDRESS(qpu_code, &mainBuffer);
+        os.write(reinterpret_cast<char*>(&tmp), sizeof(unsigned));
+        tmp = AS_GPU_ADDRESS(firstUniformPointer, &mainBuffer);
+        os.write(reinterpret_cast<char*>(&tmp), sizeof(unsigned));
+        tmp = static_cast<uint32_t>(
+            kernel->info.uniformsUsed.countUniforms() + 1 /* re-run flag */ + kernel->info.getExplicitUniformCount());
+        os.write(reinterpret_cast<char*>(&tmp), sizeof(unsigned));
+        tmp = static_cast<unsigned>(kernel->info.uniformsUsed.value);
+        os.write(reinterpret_cast<char*>(&tmp), sizeof(unsigned));
+        // write buffer contents
+        os.write(reinterpret_cast<char*>(mainBuffer.hostPointer), static_cast<uint32_t>(mainBuffer.size));
+    }
+    // append additionally the kernel parameter for this execution
+    // append 0-word as border between sections for initial dump and all bits set for end-of-execution dump
+    unsigned tmp = printHead ? 0 : 0xFFFFFFFFu;
+    os.write(reinterpret_cast<char*>(&tmp), sizeof(unsigned));
+    // parameter have this format: pointer-bit| # words | <data (direct or buffer contents)>
+    for(unsigned i = 0; i < args.executionArguments.size(); ++i)
+    {
+        const auto& arg = args.executionArguments[i];
+        auto bufferIt = args.persistentBuffers.find(i);
+        auto tmpIt = args.tmpBuffers.find(i);
+        if(bufferIt != args.persistentBuffers.end())
+        {
+            dumpBuffer(os, bufferIt->second.first.get());
+        }
+        else if(tmpIt != args.tmpBuffers.end())
+        {
+            dumpBuffer(os, tmpIt->second.get());
+        }
+        else if(auto scalar = dynamic_cast<const ScalarArgument*>(arg.get()))
+        {
+            tmp = static_cast<uint32_t>(scalar->scalarValues.size());
+            os.write(reinterpret_cast<char*>(&tmp), sizeof(unsigned));
+            for(const auto elem : scalar->scalarValues)
+            {
+                tmp = elem.getUnsigned();
+                os.write(reinterpret_cast<char*>(&tmp), sizeof(unsigned));
+            }
+        }
+    }
 }
 
 cl_int executeKernel(KernelExecution& args)
 {
-    Kernel* kernel = args.kernel.get();
+    const Kernel* kernel = args.kernel.get();
     CHECK_KERNEL(kernel)
 
     // the number of QPUs is the product of all local sizes
     const size_t num_qpus = args.localSizes[0] * args.localSizes[1] * args.localSizes[2];
-    if(num_qpus > V3D::instance().getSystemInfo(SystemInfo::QPU_COUNT))
+    if(num_qpus > args.v3d->getSystemInfo(SystemInfo::QPU_COUNT))
         return CL_INVALID_GLOBAL_WORK_SIZE;
 
     // first work-group has group_ids 0,0,0
@@ -170,24 +243,24 @@ cl_int executeKernel(KernelExecution& args)
     bool isWorkGroupLoopEnabled = kernel->info.uniformsUsed.getMaxGroupIDXUsed() ||
         kernel->info.uniformsUsed.getMaxGroupIDYUsed() || kernel->info.uniformsUsed.getMaxGroupIDZUsed();
 
-#ifdef DEBUG_MODE
-    LOG(std::cout << "Running kernel '" << kernel->info.name << "' with " << kernel->info.getLength()
-                  << " instructions..." << std::endl)
-    LOG(std::cout << "Local sizes: " << args.localSizes[0] << " " << args.localSizes[1] << " " << args.localSizes[2]
-                  << " -> " << num_qpus << " QPUs" << std::endl)
-    LOG(std::cout << "Global sizes: " << args.globalSizes[0] << " " << args.globalSizes[1] << " " << args.globalSizes[2]
+    DEBUG_LOG(DebugLevel::KERNEL_EXECUTION, {
+        std::cout << "Running kernel '" << kernel->info.name << "' with " << kernel->info.getLength()
+                  << " instructions..." << std::endl;
+        std::cout << "Local sizes: " << args.localSizes[0] << " " << args.localSizes[1] << " " << args.localSizes[2]
+                  << " -> " << num_qpus << " QPUs" << std::endl;
+        std::cout << "Global sizes: " << args.globalSizes[0] << " " << args.globalSizes[1] << " " << args.globalSizes[2]
                   << " -> " << (args.globalSizes[0] * args.globalSizes[1] * args.globalSizes[2]) / num_qpus
-                  << " work-groups (" << (isWorkGroupLoopEnabled ? "all at once" : "separate") << ")" << std::endl)
-#endif
+                  << " work-groups (" << (isWorkGroupLoopEnabled ? "all at once" : "separate") << ")" << std::endl;
+    })
 
     //
     // ALLOCATE BUFFER
     //
-    size_t buffer_size = get_size(kernel->info.getLength() * sizeof(uint64_t),
+    size_t buffer_size = get_size(args.v3d, kernel->info.getLength() * sizeof(uint64_t),
         num_qpus * (MAX_HIDDEN_PARAMETERS + kernel->info.getExplicitUniformCount()),
         kernel->program->globalData.size() * sizeof(uint64_t), kernel->program->moduleInfo.getStackFrameSize());
 
-    std::unique_ptr<DeviceBuffer> buffer(mailbox().allocateBuffer(static_cast<unsigned>(buffer_size)));
+    std::unique_ptr<DeviceBuffer> buffer(args.mailbox->allocateBuffer(static_cast<unsigned>(buffer_size)));
     if(!buffer)
         return CL_OUT_OF_RESOURCES;
 
@@ -215,35 +288,32 @@ cl_int executeKernel(KernelExecution& args)
     const unsigned global_data = AS_GPU_ADDRESS(p, buffer.get());
     if(!kernel->program->globalData.empty())
     {
-        void* data_start = kernel->program->globalData.data();
+        const void* data_start = kernel->program->globalData.data();
         const unsigned data_length = static_cast<unsigned>(kernel->program->globalData.size() * sizeof(uint64_t));
         memcpy(p, data_start, data_length);
         p += data_length / sizeof(unsigned);
+        DEBUG_LOG(DebugLevel::KERNEL_EXECUTION,
+            std::cout << "Copied " << data_length << " bytes of global data to device buffer" << std::endl)
     }
-#ifdef DEBUG_MODE
-    LOG(std::cout << "Copied " << data_length << " bytes of global data to device buffer" << std::endl)
-#endif
 
     // Reserve space for stack-frames and fill it with zeros (e.g. for cl_khr_initialize_memory extension)
-    uint32_t maxQPUS = V3D::instance().getSystemInfo(SystemInfo::QPU_COUNT);
+    uint32_t maxQPUS = args.v3d->getSystemInfo(SystemInfo::QPU_COUNT);
     uint32_t stackFrameSize = static_cast<uint32_t>(kernel->program->moduleInfo.getStackFrameSize() * sizeof(uint64_t));
-#ifdef DEBUG_MODE
-    LOG(std::cout << "Reserving space for " << maxQPUS << " stack-frames of " << stackFrameSize << " bytes each"
+    DEBUG_LOG(DebugLevel::KERNEL_EXECUTION,
+        std::cout << "Reserving space for " << maxQPUS << " stack-frames of " << stackFrameSize << " bytes each"
                   << std::endl)
-#endif
     if(kernel->program->context()->initializeMemoryToZero(CL_CONTEXT_MEMORY_INITIALIZE_PRIVATE_KHR))
         memset(p, '\0', maxQPUS * stackFrameSize);
     p += (maxQPUS * stackFrameSize) / sizeof(unsigned);
 
     // Copy QPU program into GPU memory
     const unsigned* qpu_code = p;
-    void* code_start = &kernel->program->binaryCode[kernel->info.getOffset()];
+    const void* code_start = &kernel->program->binaryCode[kernel->info.getOffset()];
     memcpy(p, code_start, kernel->info.getLength() * sizeof(uint64_t));
     p += kernel->info.getLength() * sizeof(uint64_t) / sizeof(unsigned);
-#ifdef DEBUG_MODE
-    LOG(std::cout << "Copied " << kernel->info.getLength() * sizeof(uint64_t)
+    DEBUG_LOG(DebugLevel::KERNEL_EXECUTION,
+        std::cout << "Copied " << kernel->info.getLength() * sizeof(uint64_t)
                   << " bytes of kernel code to device buffer" << std::endl)
-#endif
 
     // 2 times (for each UNIFORM block) 16 times (for each possible QPU)
     std::array<std::array<unsigned*, 16>, 2> uniformPointers;
@@ -260,14 +330,24 @@ cl_int executeKernel(KernelExecution& args)
             auto persistentBufferIt = args.persistentBuffers.find(u);
             if(tmpBufferIt != args.tmpBuffers.end())
             {
-                // there exists a temporary buffer for the __local/struct parameter, so set its address as kernel
-                // argument
-                *p++ = static_cast<unsigned>(tmpBufferIt->second->qpuPointer);
-#ifdef DEBUG_MODE
-                LOG(std::cout << "Setting parameter " << (kernel->info.uniformsUsed.countUniforms() + u)
-                              << " to temporary buffer 0x" << std::hex << tmpBufferIt->second->qpuPointer << std::dec
-                              << std::endl)
-#endif
+                if(!tmpBufferIt->second)
+                {
+                    // the __local parameter is lowered into VPM, so there is no temporary buffer
+                    *p++ = 0u;
+                    DEBUG_LOG(DebugLevel::KERNEL_EXECUTION,
+                        std::cout << "Setting lowered parameter " << (kernel->info.uniformsUsed.countUniforms() + u)
+                                  << " to null-pointer" << std::endl)
+                }
+                else
+                {
+                    // there exists a temporary buffer for the __local/struct parameter, so set its address as
+                    // kernel argument
+                    *p++ = static_cast<unsigned>(tmpBufferIt->second->qpuPointer);
+                    DEBUG_LOG(DebugLevel::KERNEL_EXECUTION,
+                        std::cout << "Setting parameter " << (kernel->info.uniformsUsed.countUniforms() + u)
+                                  << " to temporary buffer 0x" << std::hex << tmpBufferIt->second->qpuPointer
+                                  << std::dec << std::endl)
+                }
             }
             else if(persistentBufferIt != args.persistentBuffers.end())
             {
@@ -278,20 +358,18 @@ cl_int executeKernel(KernelExecution& args)
                     static_cast<unsigned>(persistentBufferIt->second.second) :
                     0u;
                 *p++ = devicePtr;
-#ifdef DEBUG_MODE
-                LOG(std::cout << "Setting parameter " << (kernel->info.uniformsUsed.countUniforms() + u)
+                DEBUG_LOG(DebugLevel::KERNEL_EXECUTION,
+                    std::cout << "Setting parameter " << (kernel->info.uniformsUsed.countUniforms() + u)
                               << " to buffer 0x" << std::hex << devicePtr << std::dec << std::endl)
-#endif
             }
-            else if(auto scalarArg = dynamic_cast<const ScalarArgument*>(kernel->args.at(u).get()))
+            else if(auto scalarArg = dynamic_cast<const ScalarArgument*>(args.executionArguments.at(u).get()))
             {
                 // "default" scalar or vector of scalar kernel argument
                 for(cl_uchar i = 0; i < kernel->info.params[u].getVectorElements(); ++i)
                     *p++ = scalarArg->scalarValues.at(i).getUnsigned();
-#ifdef DEBUG_MODE
-                LOG(std::cout << "Setting parameter " << (kernel->info.uniformsUsed.countUniforms() + u)
+                DEBUG_LOG(DebugLevel::KERNEL_EXECUTION,
+                    std::cout << "Setting parameter " << (kernel->info.uniformsUsed.countUniforms() + u)
                               << " to scalar " << scalarArg->to_string() << std::endl)
-#endif
             }
             else
             {
@@ -312,10 +390,9 @@ cl_int executeKernel(KernelExecution& args)
         increment_index(local_indices, args.localSizes, 1);
     }
 
-#ifdef DEBUG_MODE
-    LOG(std::cout << (kernel->info.uniformsUsed.countUniforms() + kernel->info.params.size()) << " parameters set."
+    DEBUG_LOG(DebugLevel::KERNEL_EXECUTION,
+        std::cout << (kernel->info.uniformsUsed.countUniforms() + kernel->info.params.size()) << " parameters set."
                   << std::endl)
-#endif
 
     // We duplicate the UNIFORM buffer, so we can have one being used by the background execution and the other is
     // prepared for the next execution
@@ -346,105 +423,21 @@ cl_int executeKernel(KernelExecution& args)
         *p++ = AS_GPU_ADDRESS(qpu_code, buffer.get());
     }
 
-#if 0
     const std::string dumpFile("/tmp/vc4cl-dump-" + kernel->info.name + "-" + std::to_string(rand()) + ".bin");
-    std::map<unsigned, const DeviceBuffer*> bufferArguments;
-    {
-        LOG(std::cout << "Dumping kernel buffer to " << dumpFile << std::endl)
-        std::ofstream f(dumpFile, std::ios_base::out | std::ios_base::trunc | std::ios_base::binary);
-        // add additional pointers for the dump-analyzer
-        // qpu base-pointer (global-data pointer) | qpu code-pointer | qpu UNIFORM-pointer | num uniforms per iteration
-        // | num iterations | implicit uniform bit-field
-        unsigned tmp = static_cast<unsigned>(buffer->qpuPointer);
-        f.write(reinterpret_cast<char*>(&tmp), sizeof(unsigned));
-        tmp = AS_GPU_ADDRESS(qpu_code, buffer.get());
-        f.write(reinterpret_cast<char*>(&tmp), sizeof(unsigned));
-        tmp = AS_GPU_ADDRESS(qpu_uniform, buffer.get());
-        f.write(reinterpret_cast<char*>(&tmp), sizeof(unsigned));
-        uint16_t tmp16 = static_cast<uint16_t>(
-            kernel->info.uniformsUsed.countUniforms() + 1 /* re-run flag */ + kernel->info.getExplicitUniformCount());
-        f.write(reinterpret_cast<char*>(&tmp16), sizeof(uint16_t));
-        tmp16 = static_cast<uint16_t>(numIterations);
-        f.write(reinterpret_cast<char*>(&tmp16), sizeof(uint16_t));
-        tmp = static_cast<unsigned>(kernel->info.uniformsUsed.value);
-        f.write(reinterpret_cast<char*>(&tmp), sizeof(unsigned));
-        // write buffer contents
-        f.write(reinterpret_cast<char*>(buffer->hostPointer), static_cast<uint32_t>(buffer_size));
-        // append additionally the kernel parameter for this execution
-        // append 0-word as border between sections
-        tmp = 0;
-        f.write(reinterpret_cast<char*>(&tmp), sizeof(unsigned));
-        // parameter have this format: pointer-bit| # words | <data (direct or buffer contents)>
-        for(unsigned i = 0; i < kernel->args.size(); ++i)
-        {
-            const auto& info = kernel->info.params[i];
-            const auto& arg = kernel->args[i];
-            if(info.getPointer() && arg.scalarValues.at(0).getUnsigned() == global_data)
-            {
-                tmp = 0x80000000 | static_cast<uint32_t>(data_length / sizeof(unsigned));
-                f.write(reinterpret_cast<char*>(&tmp), sizeof(unsigned));
-                f.write(reinterpret_cast<const char*>(buffer->hostPointer), data_length);
-            }
-            else if(info.getPointer())
-            {
-                // search for local/struct buffers allocated by the kernel execution
-                const DeviceBuffer* buffer = nullptr;
-                if(tmpBuffers.find(i) != tmpBuffers.end())
-                    buffer = tmpBuffers[i].get();
-                else
-                {
-                    // fall back to global memory objects
-                    auto tmpBuffer = static_cast<const Buffer*>(
-                        ObjectTracker::findTrackedObject([&](const BaseObject& base) -> bool {
-                            if(base.typeName == _cl_mem::TYPE_NAME || strcmp(base.typeName, _cl_mem::TYPE_NAME) == 0)
-                            {
-                                const auto& buffer = static_cast<const vc4cl::Buffer&>(base);
-                                const auto& devBuffer = buffer.deviceBuffer;
-                                return devBuffer &&
-                                    static_cast<uint32_t>(devBuffer->qpuPointer) ==
-                                    arg.scalarValues.at(0).getUnsigned();
-                            }
-                            return false;
-                        }));
-                    if(tmpBuffer)
-                        buffer = tmpBuffer->deviceBuffer.get();
-                }
-                if(buffer == nullptr)
-                {
-                    tmp = 1;
-                    f.write(reinterpret_cast<char*>(&tmp), sizeof(unsigned));
-                    tmp = arg.scalarValues.front().getUnsigned();
-                    f.write(reinterpret_cast<char*>(&tmp), sizeof(unsigned));
-                }
-                else
-                {
-                    bufferArguments.emplace(i, buffer);
-                    tmp = 0x80000000 | static_cast<uint32_t>(buffer->size / sizeof(unsigned));
-                    f.write(reinterpret_cast<char*>(&tmp), sizeof(unsigned));
-                    f.write(reinterpret_cast<const char*>(buffer->hostPointer), buffer->size);
-                }
-            }
-            else
-            {
-                tmp = static_cast<uint32_t>(arg.scalarValues.size());
-                f.write(reinterpret_cast<char*>(&tmp), sizeof(unsigned));
-                for(const auto elem : arg.scalarValues)
-                {
-                    tmp = elem.getUnsigned();
-                    f.write(reinterpret_cast<char*>(&tmp), sizeof(unsigned));
-                }
-            }
-        }
-    }
-#endif
+    std::ofstream f;
+    DEBUG_LOG(DebugLevel::KERNEL_EXECUTION, {
+        // Dump all memory content accessed by this kernel execution
+        std::cout << "Dumping kernel buffer to " << dumpFile << std::endl;
+        f.open(dumpFile, std::ios_base::out | std::ios_base::trunc | std::ios_base::binary);
+        dumpMemoryState(f, kernel, args, *buffer, qpu_code, uniformPointers[0][0], true);
+    })
 
-        //
-        // EXECUTION
-        //
-#ifdef DEBUG_MODE
-    LOG(std::cout << "Running work-group " << group_indices[0] << ", " << group_indices[1] << ", " << group_indices[2]
+    //
+    // EXECUTION
+    //
+    DEBUG_LOG(DebugLevel::KERNEL_EXECUTION,
+        std::cout << "Running work-group " << group_indices[0] << ", " << group_indices[1] << ", " << group_indices[2]
                   << std::endl)
-#endif
     // toggle between the first and second launch message block to toggle between the first and second UNIFORMs
     // block
     auto qpu_msg_current = qpu_msg_0;
@@ -454,12 +447,11 @@ cl_int executeKernel(KernelExecution& args)
     // calculate execution timeout depending on the number of work-groups to be executed at once
     auto timeout = KERNEL_TIMEOUT * std::max(std::size_t{30}, group_limits[0] * group_limits[1] * group_limits[2]);
     // on first execution, flush code cache
-    auto result = executeQPU(static_cast<unsigned>(num_qpus),
+    auto result = executeQPU(args.mailbox, args.v3d, static_cast<unsigned>(num_qpus),
         std::make_pair(qpu_msg_current, AS_GPU_ADDRESS(qpu_msg_current, buffer.get())), true, timeout);
-#ifdef DEBUG_MODE
     // NOTE: This disables background-execution!
-    LOG(std::cout << "Execution: " << (result.waitFor() ? "successful" : "failed") << std::endl)
-#endif
+    DEBUG_LOG(DebugLevel::KERNEL_EXECUTION,
+        std::cout << "Execution: " << (result.waitFor() ? "successful" : "failed") << std::endl)
 
     while(!isWorkGroupLoopEnabled && increment_index(group_indices, group_limits, 1))
     {
@@ -479,68 +471,24 @@ cl_int executeKernel(KernelExecution& args)
         // wait for and check previous work-group (possible asynchronous) execution
         if(!result.waitFor())
             return CL_OUT_OF_RESOURCES;
-#ifdef DEBUG_MODE
-        LOG(std::cout << "Running work-group " << group_indices[0] << ", " << group_indices[1] << ", "
+        DEBUG_LOG(DebugLevel::KERNEL_EXECUTION,
+            std::cout << "Running work-group " << group_indices[0] << ", " << group_indices[1] << ", "
                       << group_indices[2] << std::endl)
-#endif
         // all following executions, don't flush cache
-        result = executeQPU(static_cast<unsigned>(num_qpus),
+        result = executeQPU(args.mailbox, args.v3d, static_cast<unsigned>(num_qpus),
             std::make_pair(qpu_msg_current, AS_GPU_ADDRESS(qpu_msg_current, buffer.get())), false, timeout);
-#ifdef DEBUG_MODE
         // NOTE: This disables background-execution!
-        LOG(std::cout << "Execution: " << (result.waitFor() ? "successful" : "failed") << std::endl)
-#endif
+        DEBUG_LOG(DebugLevel::KERNEL_EXECUTION,
+            std::cout << "Execution: " << (result.waitFor() ? "successful" : "failed") << std::endl)
     }
 
-#if 0
-    {
-        std::ofstream f(dumpFile, std::ios_base::out | std::ios_base::app | std::ios_base::binary);
-        // append additionally the kernel parameter for this execution
-        // append all-bits-set-word as border between sections
-        unsigned tmp = 0xFFFFFFFF;
-        f.write(reinterpret_cast<char*>(&tmp), sizeof(unsigned));
-        // parameter have this format: pointer-bit| # words | <data (direct or buffer contents)>
-        for(unsigned i = 0; i < kernel->args.size(); ++i)
-        {
-            const auto& info = kernel->info.params[i];
-            const auto& arg = kernel->args[i];
-            if(info.getPointer() && arg.scalarValues.at(0).getUnsigned() == global_data)
-            {
-                tmp = 0x80000000 | static_cast<uint32_t>(data_length / sizeof(unsigned));
-                f.write(reinterpret_cast<char*>(&tmp), sizeof(unsigned));
-                f.write(reinterpret_cast<const char*>(buffer->hostPointer), data_length);
-            }
-            else if(info.getPointer())
-            {
-                auto bufferIt = bufferArguments.find(i);
-                if(bufferIt == bufferArguments.end())
-                {
-                    tmp = 1;
-                    f.write(reinterpret_cast<char*>(&tmp), sizeof(unsigned));
-                    tmp = arg.scalarValues.front().getUnsigned();
-                    f.write(reinterpret_cast<char*>(&tmp), sizeof(unsigned));
-                }
-                else
-                {
-                    //FIXME SEGFAULTS if buffer already freed! -> error in client
-                    tmp = 0x80000000 | static_cast<uint32_t>(bufferIt->second->size / sizeof(unsigned));
-                    f.write(reinterpret_cast<char*>(&tmp), sizeof(unsigned));
-                    f.write(reinterpret_cast<const char*>(bufferIt->second->hostPointer), bufferIt->second->size);
-                }
-            }
-            else
-            {
-                tmp = static_cast<uint32_t>(arg.scalarValues.size());
-                f.write(reinterpret_cast<char*>(&tmp), sizeof(unsigned));
-                for(const auto elem : arg.scalarValues)
-                {
-                    tmp = elem.getUnsigned();
-                    f.write(reinterpret_cast<char*>(&tmp), sizeof(unsigned));
-                }
-            }
-        }
-    }
-#endif
+    // wait for (possible asynchronous) execution before freeing the buffers
+    auto status = result.waitFor();
+
+    DEBUG_LOG(DebugLevel::KERNEL_EXECUTION, {
+        // Append the buffers after the kernel execution
+        dumpMemoryState(f, kernel, args, *buffer, qpu_code, uniformPointers[0][0], false);
+    })
 
     //
     // CLEANUP
@@ -550,8 +498,7 @@ cl_int executeKernel(KernelExecution& args)
     // since we do not need the buffers anymore
     args.tmpBuffers.clear();
     args.persistentBuffers.clear();
+    args.executionArguments.clear();
 
-    if(result.waitFor())
-        return CL_COMPLETE;
-    return CL_OUT_OF_RESOURCES;
+    return status ? CL_COMPLETE : CL_OUT_OF_RESOURCES;
 }

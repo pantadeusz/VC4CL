@@ -19,15 +19,19 @@ static ObjectTracker liveObjectsTracker;
 
 ObjectTracker::~ObjectTracker()
 {
-// since this is called at the end of the program,
-// all objects still alive here are leaked!
-#ifdef DEBUG_MODE
-    for(const auto& obj : liveObjects)
+    // since this is called at the end of the program,
+    // all objects still alive here are leaked!
+    if(!liveObjects.empty())
     {
-        std::cout << "[VC4CL] Leaked object with " << obj->referenceCount << " references: " << obj->typeName << "\n";
+        DEBUG_LOG(DebugLevel::OBJECTS, {
+            for(const auto& obj : liveObjects)
+            {
+                std::cout << "[VC4CL] Leaked object " << obj->getBasePointer() << " with " << obj->referenceCount
+                          << " references: " << obj->typeName << "\n";
+            }
+            std::cout << std::endl;
+        })
     }
-    std::cout << std::endl;
-#endif
 
     // the remaining objects reference one another
     // since deleting one object may remove another, we cannot use the cleanup-function of the container's destructor
@@ -35,7 +39,7 @@ ObjectTracker::~ObjectTracker()
     while(!liveObjects.empty())
     {
         // we delete from the back, since the first objects are usually things like device, context, etc. and still
-        // referenced by the other objects (since unique_ptr are sorted by address and lower addresses are used first)
+        // referenced by the other objects (since we insert our pointers in the order of creation)
         liveObjects.erase(--liveObjects.end());
     }
 }
@@ -43,26 +47,27 @@ ObjectTracker::~ObjectTracker()
 void ObjectTracker::addObject(BaseObject* obj)
 {
     std::lock_guard<std::recursive_mutex> guard(liveObjectsTracker.trackerMutex);
-    liveObjectsTracker.liveObjects.emplace(obj);
-#ifdef DEBUG_MODE
-    LOG(std::cout << "Tracking live-time of object: " << obj->typeName << std::endl)
-#endif
+    liveObjectsTracker.liveObjects.emplace_back(obj);
+    DEBUG_LOG(DebugLevel::OBJECTS,
+        std::cout << "Tracking live-time of object: " << obj->getBasePointer() << " (" << obj->typeName << ')'
+                  << std::endl)
 }
 
 void ObjectTracker::removeObject(BaseObject* obj)
 {
     std::lock_guard<std::recursive_mutex> guard(liveObjectsTracker.trackerMutex);
-#ifdef DEBUG_MODE
-    LOG(std::cout << "Releasing live-time of object: " << obj->typeName << std::endl)
-#endif
+    DEBUG_LOG(DebugLevel::OBJECTS,
+        std::cout << "Releasing live-time of object: " << obj->getBasePointer() << " (" << obj->typeName << ')'
+                  << std::endl)
+    // TODO since the short-lived objects tend to be located at the end, we should search in reverse direction!
     auto it = std::find_if(liveObjectsTracker.liveObjects.begin(), liveObjectsTracker.liveObjects.end(),
         [obj](const std::unique_ptr<BaseObject>& ptr) -> bool { return ptr.get() == obj; });
     if(it != liveObjectsTracker.liveObjects.end())
         liveObjectsTracker.liveObjects.erase(it);
-#ifdef DEBUG_MODE
     else
-        LOG(std::cout << "Removing object not previously tracked: " << obj->typeName << std::endl)
-#endif
+        DEBUG_LOG(DebugLevel::OBJECTS,
+            std::cout << "Removing object not previously tracked: " << obj->getBasePointer() << " (" << obj->typeName
+                      << ')' << std::endl)
 }
 
 void ObjectTracker::iterateObjects(ReportFunction func, void* userData)

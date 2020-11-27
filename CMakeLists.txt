@@ -12,12 +12,12 @@ option(BUILD_ICD "Build with support for ICD" ON)
 option(IMAGE_SUPPORT "Experimental image support" OFF)
 # Option whether to use register-poking (faster) or mailbox-calls (synchronized system-wide) to run kernels
 option(REGISTER_POKE_KERNELS "Use the faster way of register to run kernels" ON)
-# Option to enable/disable test-program
-option(BUILD_DEBUG "Build with debugging symbols. Otherwise build for performance" OFF)
 # Option to enable/disable cross compilation
 option(CROSS_COMPILE "Cross compile for Raspbian" OFF)
 # Option whether to emulate the hardware interface for testing purposes
 option(MOCK_HAL "Emulate hardware interface" OFF)
+# Option whether to enable code coverage analysis via gcov
+option(ENABLE_COVERAGE "Enables collection of code coverage via gcov" OFF)
 # Option whether to enable more compile-time checks
 option(ADVANCED_CHECKS "Enable advanced compile-time checks" OFF)
 
@@ -46,10 +46,6 @@ if(NOT CMAKE_BUILD_TYPE)
 	set(CMAKE_BUILD_TYPE "Debug" CACHE STRING "Choose the type of build." FORCE)
 endif()
 
-if("${CMAKE_BUILD_TYPE}" STREQUAL "Release")
-	set(BUILD_DEBUG OFF)
-endif()
-
 # Set optimization and warning flags for the build types
 include(cmake/flags.cmake)
 
@@ -72,8 +68,10 @@ else()
 	set_property(DIRECTORY ${VC4C_SOURCE_DIR} PROPERTY EP_UPDATE_DISCONNECTED 0)
 endif()
 
-# Check for OpenCL headers
-find_package(OpenCL REQUIRED)
+# Check for OpenCL headers (if not specified manually)
+if(NOT OpenCL_INCLUDE_DIRS)
+	find_package(OpenCL REQUIRED)
+endif()
 message(STATUS "Found headers for OpenCL up to version ${OpenCL_VERSION_STRING} located in ${OpenCL_INCLUDE_DIRS}")
 
 # Check for and include the compiler binaries and header
@@ -88,8 +86,8 @@ if(IMAGE_SUPPORT)
 endif()
 
 if(MOCK_HAL)
-	if(NOT VC4C_HEADER_PATH)
-		message(ERROR "Cannot run in emulation mode without compiler available!")
+	if(NOT (INCLUDE_COMPILER AND VC4C_HEADER_PATH))
+		message(SEND_ERROR "Cannot run in emulation mode without compiler available!")
 	endif()
 	# Disable ICD loading to support directly forcing the emulation runtime
 	# (e.g. via LD_PRELOAD)

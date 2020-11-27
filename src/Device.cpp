@@ -54,7 +54,7 @@ cl_int Device::getInfo(
         //"Maximum number of work-items that can be specified in each dimension of the work-group.
         // Returns n size_t entries, where n is the value returned by the query for CL_DEVICE_MAX_WORK_ITEM_DIMENSIONS.
         // The minimum value is (1, 1, 1)."
-        size_t numQPUs = V3D::instance().getSystemInfo(SystemInfo::QPU_COUNT);
+        size_t numQPUs = V3D::instance()->getSystemInfo(SystemInfo::QPU_COUNT);
         std::array<size_t, kernel_config::NUM_DIMENSIONS> tmp{numQPUs, numQPUs, numQPUs};
         return returnValue(tmp.data(), sizeof(size_t), tmp.size(), param_value_size, param_value, param_value_size_ret);
     }
@@ -62,7 +62,7 @@ cl_int Device::getInfo(
         //"Maximum number of work-items in a work-group executing a kernel on a single compute unit, using the data
         // parallel execution model."
         return returnValue<size_t>(
-            V3D::instance().getSystemInfo(SystemInfo::QPU_COUNT), param_value_size, param_value, param_value_size_ret);
+            V3D::instance()->getSystemInfo(SystemInfo::QPU_COUNT), param_value_size, param_value, param_value_size_ret);
     case CL_DEVICE_PREFERRED_VECTOR_WIDTH_CHAR:
         //"Preferred native vector width size for built-in scalar types that can be put into vectors.
         // The vector width is defined as the number of scalar elements that can be stored in the vector. "
@@ -103,7 +103,7 @@ cl_int Device::getInfo(
     {
         //"Maximum configured clock frequency of the device in MHz."
         QueryMessage<MailboxTag::GET_MAX_CLOCK_RATE> msg({static_cast<uint32_t>(VC4Clock::V3D)});
-        if(!mailbox().readMailboxMessage(msg))
+        if(!mailbox()->readMailboxMessage(msg))
             return returnError(CL_INVALID_VALUE, __FILE__, __LINE__, "Error reading mailbox-info V3D max clock rate!");
         return returnValue<cl_uint>(msg.getContent(1) / 1000000 /* clock rate is in Hz -> MHz */, param_value_size,
             param_value, param_value_size_ret);
@@ -117,7 +117,7 @@ cl_int Device::getInfo(
         //"Max size of memory object allocation in bytes.  The minimum value is max (1/4th of CL_DEVICE_GLOBAL_MEM_SIZE,
         // 1 MB)"
         return returnValue<cl_ulong>(
-            mailbox().getTotalGPUMemory(), param_value_size, param_value, param_value_size_ret);
+            mailbox()->getTotalGPUMemory(), param_value_size, param_value, param_value_size_ret);
     case CL_DEVICE_IMAGE_SUPPORT:
         //"Is CL_TRUE if images are supported by the OpenCL device and CL_FALSE otherwise."
 #ifdef IMAGE_SUPPORT
@@ -128,11 +128,11 @@ cl_int Device::getInfo(
     case CL_DEVICE_MAX_READ_IMAGE_ARGS:
         //"Max number of simultaneous image objects that can be read by a kernel."
         return returnValue<cl_uint>(
-            kernel_config::MAX_PARAMETER_COUNT, param_value_size, param_value, param_value_size_ret);
+            kernel_config::MAX_PARAMETER_COUNT / 2, param_value_size, param_value, param_value_size_ret);
     case CL_DEVICE_MAX_WRITE_IMAGE_ARGS:
         //"Max number of simultaneous image objects that can be written to by a kernel."
         return returnValue<cl_uint>(
-            kernel_config::MAX_PARAMETER_COUNT, param_value_size, param_value, param_value_size_ret);
+            kernel_config::MAX_PARAMETER_COUNT / 2, param_value_size, param_value, param_value_size_ret);
     case CL_DEVICE_IMAGE2D_MAX_WIDTH:
         //"Max width of 2D image in pixels.  The minimum value is 2048 [...]"
         return returnValue<size_t>(
@@ -164,7 +164,7 @@ cl_int Device::getInfo(
     case CL_DEVICE_MAX_SAMPLERS:
         //"Maximum number of samplers that can be used in a kernel."
         return returnValue<cl_uint>(
-            kernel_config::MAX_PARAMETER_COUNT, param_value_size, param_value, param_value_size_ret);
+            kernel_config::MAX_PARAMETER_COUNT / 2, param_value_size, param_value, param_value_size_ret);
     case CL_DEVICE_MAX_PARAMETER_SIZE:
         //"Max size in bytes of the arguments that can be passed to a kernel. The minimum value is 1024 (256 for
         // EMBEDDED PROFILE)."
@@ -218,16 +218,18 @@ cl_int Device::getInfo(
     case CL_DEVICE_GLOBAL_MEM_SIZE:
         //"Size of global device memory in bytes."
         return returnValue<cl_ulong>(
-            mailbox().getTotalGPUMemory(), param_value_size, param_value, param_value_size_ret);
+            mailbox()->getTotalGPUMemory(), param_value_size, param_value, param_value_size_ret);
     case CL_DEVICE_MAX_CONSTANT_BUFFER_SIZE:
         //"Max size in bytes of a constant buffer allocation.  The minimum value is 64 KB (1KB for EMBEDDED PROFILE)"
         return returnValue<cl_ulong>(
-            mailbox().getTotalGPUMemory(), param_value_size, param_value, param_value_size_ret);
+            mailbox()->getTotalGPUMemory(), param_value_size, param_value, param_value_size_ret);
     case CL_DEVICE_MAX_CONSTANT_ARGS:
         //"Max number of arguments declared with the __constant qualifier in a kernel.  The minimum value is 8 (4 for
         // EMBEDDED PROFILE)"
+        // Return less than our hard parameter limit to make the OpenCL-CTS test pass. We still support way more
+        // __constant parameters than required.
         return returnValue<cl_uint>(
-            kernel_config::MAX_PARAMETER_COUNT, param_value_size, param_value, param_value_size_ret);
+            kernel_config::MAX_PARAMETER_COUNT / 2, param_value_size, param_value, param_value_size_ret);
     case CL_DEVICE_LOCAL_MEM_TYPE:
         //"Type of local memory supported.  This can be set to CL_LOCAL implying dedicated local memory storage such as
         // SRAM, or CL_GLOBAL."  memory is always global
@@ -235,7 +237,7 @@ cl_int Device::getInfo(
     case CL_DEVICE_LOCAL_MEM_SIZE:
         //"Size of local memory arena in bytes.  The minimum value is 32 KB (1KB for EMBEDDED PROFILE)"
         return returnValue<cl_ulong>(
-            mailbox().getTotalGPUMemory(), param_value_size, param_value, param_value_size_ret);
+            mailbox()->getTotalGPUMemory(), param_value_size, param_value, param_value_size_ret);
     case CL_DEVICE_ERROR_CORRECTION_SUPPORT:
         // Is CL_TRUE if the device implements error correction for all accesses to compute device memory (global and
         // constant)"
@@ -316,7 +318,8 @@ cl_int Device::getInfo(
         // TODO are all platform extensions always also device extensions?? Or is my associated wrong?
         // OpenCL CTS expects e.g. "cl_khr_spir" and "cl_khr_icd" to be device extensions (see
         // https://github.com/KhronosGroup/OpenCL-CTS/blob/cl12_trunk/test_conformance/compiler/test_compiler_defines_for_extensions.cpp)
-        return returnString(joinStrings(device_config::EXTENSIONS) + " " + joinStrings(platform_config::EXTENSIONS),
+        return returnString(joinStrings(device_config::EXTENSIONS, [](const Extension& e) { return e.name; }) + " " +
+                joinStrings(platform_config::EXTENSIONS, [](const Extension& e) { return e.name; }),
             param_value_size, param_value, param_value_size_ret);
     case CL_DEVICE_PRINTF_BUFFER_SIZE:
         //"Maximum size of the internal buffer that holds the output of printf calls from a kernel.
@@ -380,7 +383,7 @@ cl_int Device::getInfo(
         // default to 0."
         QueryMessage<MailboxTag::GET_TEMPERATURE> msg({0});
         //"Return the temperature of the SoC in thousandths of a degree C. id should be zero."
-        if(!mailbox().readMailboxMessage(msg))
+        if(!mailbox()->readMailboxMessage(msg))
             return returnError(CL_INVALID_VALUE, __FILE__, __LINE__, "Error reading mailbox-info device temperature!");
         return returnValue<cl_int>(msg.getContent(1) / 1000, param_value_size, param_value, param_value_size_ret);
     }
@@ -388,6 +391,50 @@ cl_int Device::getInfo(
         // cl_arm_core_id - https://www.khronos.org/registry/OpenCL/extensions/arm/cl_arm_get_core_id.txt
         // "returns a bitfield where each bit set represents the presence of compute unit whose ID is the bit position."
         return returnValue<cl_ulong>(1, param_value_size, param_value, param_value_size_ret);
+    case CL_DEVICE_NUMERIC_VERSION_KHR:
+        // cl_khr_extended_versioning
+        // "Returns detailed (major, minor, patch) numeric version information. The major and minor version numbers
+        // returned must match those returned via `CL_DEVICE_VERSION`."
+        return returnValue<cl_version_khr>(
+            CL_MAKE_VERSION_KHR(1, 2, 0), param_value_size, param_value, param_value_size_ret);
+    case CL_DEVICE_OPENCL_C_NUMERIC_VERSION_KHR:
+        // cl_khr_extended_versioning
+        // "Returns detailed (major, minor, patch) numeric version information. The major and minor version numbers
+        // returned must match those returned via `CL_DEVICE_OPENCL_C_VERSION`."
+        return returnValue<cl_version_khr>(
+            CL_MAKE_VERSION_KHR(1, 2, 0), param_value_size, param_value, param_value_size_ret);
+    case CL_DEVICE_EXTENSIONS_WITH_VERSION_KHR:
+    {
+        // cl_khr_extended_versioning
+        // "Returns an array of description (name and version) structures. The same extension name must not be reported
+        // more than once. The list of extensions reported must match the list reported via `CL_DEVICE_EXTENSIONS`."
+        // TODO see CL_DEVICE_EXTENSIONS for the discussion whether all platform extensions also have to be listed for
+        // the device
+        auto allExtensions = device_config::EXTENSIONS;
+        allExtensions.insert(
+            allExtensions.end(), platform_config::EXTENSIONS.begin(), platform_config::EXTENSIONS.end());
+        return returnExtensions(allExtensions, param_value_size, param_value, param_value_size_ret);
+    }
+    case CL_DEVICE_ILS_WITH_VERSION_KHR:
+    {
+        // cl_khr_extended_versioning
+        // "Returns an array of descriptions (name and version) for all supported Intermediate Languages. Intermediate
+        // Languages with the same name may be reported more than once but each name and major/minor version combination
+        // may only be reported once. The list of intermediate languages reported must match the list reported via
+        // `CL_DEVICE_IL_VERSION`."
+        std::vector<cl_name_version_khr> data{
+            cl_name_version_khr{CL_MAKE_VERSION_KHR(SPIR_VERSION_MAJOR, SPIR_VERSION_MINOR, 0), "SPIR"},
+            cl_name_version_khr{CL_MAKE_VERSION_KHR(SPIRV_VERSION_MAJOR, SPIRV_VERSION_MINOR, 0), "SPIR-V"}};
+        return returnValue(
+            data.data(), sizeof(cl_name_version_khr), data.size(), param_value_size, param_value, param_value_size_ret);
+    }
+    case CL_DEVICE_BUILT_IN_KERNELS_WITH_VERSION_KHR:
+        // cl_khr_extended_versioning
+        // "Returns an array of descriptions for the built-in kernels supported by the device. Each built-in kernel may
+        // only be reported once. The list of reported kernels must match the list returned via
+        // `CL_DEVICE_BUILT_IN_KERNELS`."
+        return returnValue(
+            nullptr, sizeof(cl_name_version_khr), 0, param_value_size, param_value, param_value_size_ret);
     default:
         // invalid parameter-name
         return returnError(
@@ -466,31 +513,18 @@ cl_int VC4CL_FUNC(clGetDeviceIDs)(cl_platform_id platform, cl_device_type device
 
     cl_uint num_found = 0;
 
-    bool device_found = false;
-    if(hasFlag<cl_device_type>(device_type, CL_DEVICE_TYPE_ACCELERATOR))
-    {
-        // OpenCL accelerator device queried -> not supported
-    }
-    if(hasFlag<cl_device_type>(device_type, CL_DEVICE_TYPE_CPU))
-    {
-        // CPU device queried -> not supported
-    }
-    if(hasFlag<cl_device_type>(device_type, CL_DEVICE_TYPE_CUSTOM))
-    {
-        // custom device queried -> not supported
-    }
     if(hasFlag<cl_device_type>(device_type, CL_DEVICE_TYPE_DEFAULT) ||
         hasFlag<cl_device_type>(device_type, CL_DEVICE_TYPE_GPU))
     {
-        device_found = true;
         // default device queried -> GPU
         if(devices != nullptr)
             devices[num_found] = Platform::getVC4CLPlatform().VideoCoreIVGPU.toBase();
-        ++num_found;
+        num_found = 1;
     }
-    if(!device_found)
+    else
         return returnError(CL_DEVICE_NOT_FOUND, __FILE__, __LINE__,
             buildString("No device for the given criteria: platform %p, type: %d!", platform, device_type));
+
     if(num_devices != nullptr)
     {
         *num_devices = num_found;

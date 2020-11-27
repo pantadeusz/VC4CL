@@ -35,6 +35,23 @@ TestKernel::TestKernel() : context(nullptr), program(nullptr), queue(nullptr), i
     TEST_ADD(TestKernel::testReleaseKernel);
 }
 
+static bool checkBuildStatus(const cl_program program)
+{
+    size_t info_size = 0;
+    cl_build_status status = 1;
+    cl_int state = VC4CL_FUNC(clGetProgramBuildInfo)(program, Platform::getVC4CLPlatform().VideoCoreIVGPU.toBase(),
+        CL_PROGRAM_BUILD_STATUS, sizeof(status), &status, &info_size);
+    if(CL_BUILD_SUCCESS != status)
+    {
+        // for better error debugging
+        std::array<char, 40960> log = {0};
+        state = VC4CL_FUNC(clGetProgramBuildInfo)(program, Platform::getVC4CLPlatform().VideoCoreIVGPU.toBase(),
+            CL_PROGRAM_BUILD_LOG, log.size(), log.data(), nullptr);
+        std::cerr << "Build log: " << log.data() << std::endl;
+    }
+    return CL_SUCCESS == state && CL_BUILD_SUCCESS == status;
+}
+
 bool TestKernel::setup()
 {
     cl_int errcode = CL_SUCCESS;
@@ -48,7 +65,7 @@ bool TestKernel::setup()
     errcode = VC4CL_FUNC(clBuildProgram)(program, 1, &device_id, nullptr, nullptr, nullptr);
     in_buffer = VC4CL_FUNC(clCreateBuffer)(context, 0, (work_size[0] * work_size[1] * work_size[2]) * sizeof(cl_char16), nullptr, &errcode);
     out_buffer = VC4CL_FUNC(clCreateBuffer)(context, 0, (work_size[0] * work_size[1] * work_size[2]) * sizeof(cl_char16), nullptr, &errcode);
-    return errcode == CL_SUCCESS && context != nullptr && queue != nullptr && program != nullptr && in_buffer != nullptr && out_buffer != nullptr;
+    return errcode == CL_SUCCESS && context && queue && program && checkBuildStatus(program) && in_buffer && out_buffer;
 }
 
 void TestKernel::testCreateKernel()
@@ -257,12 +274,12 @@ void TestKernel::testKernelResult()
 	TEST_ASSERT_EQUALS(strlen(input), strlen(reinterpret_cast<const char*>(toType<Buffer>(out_buffer)->deviceBuffer->hostPointer)));
 	TEST_ASSERT_EQUALS(std::string(input), std::string(reinterpret_cast<const char*>(toType<Buffer>(in_buffer)->deviceBuffer->hostPointer), strlen(input)));
 	TEST_ASSERT_EQUALS(std::string(input), std::string(reinterpret_cast<const char*>(toType<Buffer>(out_buffer)->deviceBuffer->hostPointer), strlen(input)));
-#ifdef DEBUG_MODE
-    char* buffer = reinterpret_cast<char*>(toType<Buffer>(in_buffer)->deviceBuffer->hostPointer);
-    printf("[%s:%d] Input buffer: %c%c%c%c%c%c%c%c%c%c%c%c%c%c%c%c (%zu)\n", __FILE__, __LINE__, buffer[0], buffer[1], buffer[2], buffer[3], buffer[4], buffer[5], buffer[6], buffer[7], buffer[8], buffer[9], buffer[10], buffer[11], buffer[12], buffer[13], buffer[14], buffer[15], strlen(buffer));
-    buffer = reinterpret_cast<char*>(toType<Buffer>(out_buffer)->deviceBuffer->hostPointer);
-    printf("[%s:%d] Output buffer: %c%c%c%c%c%c%c%c%c%c%c%c%c%c%c%c (%zu)\n", __FILE__, __LINE__, buffer[0], buffer[1], buffer[2], buffer[3], buffer[4], buffer[5], buffer[6], buffer[7], buffer[8], buffer[9], buffer[10], buffer[11], buffer[12], buffer[13], buffer[14], buffer[15], strlen(buffer));
-#endif
+	DEBUG_LOG(DebugLevel::KERNEL_EXECUTION, {
+		char* buffer = reinterpret_cast<char*>(toType<Buffer>(in_buffer)->deviceBuffer->hostPointer);
+		printf("[%s:%d] Input buffer: %c%c%c%c%c%c%c%c%c%c%c%c%c%c%c%c (%zu)\n", __FILE__, __LINE__, buffer[0], buffer[1], buffer[2], buffer[3], buffer[4], buffer[5], buffer[6], buffer[7], buffer[8], buffer[9], buffer[10], buffer[11], buffer[12], buffer[13], buffer[14], buffer[15], strlen(buffer));
+		buffer = reinterpret_cast<char*>(toType<Buffer>(out_buffer)->deviceBuffer->hostPointer);
+		printf("[%s:%d] Output buffer: %c%c%c%c%c%c%c%c%c%c%c%c%c%c%c%c (%zu)\n", __FILE__, __LINE__, buffer[0], buffer[1], buffer[2], buffer[3], buffer[4], buffer[5], buffer[6], buffer[7], buffer[8], buffer[9], buffer[10], buffer[11], buffer[12], buffer[13], buffer[14], buffer[15], strlen(buffer));
+	})
 }
 
 void TestKernel::testEnqueueTask()

@@ -13,6 +13,7 @@
 
 #include <bitset>
 #include <map>
+#include <memory>
 #include <vector>
 
 namespace vc4cl
@@ -21,6 +22,8 @@ namespace vc4cl
     struct DevicePointer;
     struct KernelArgument;
     class Buffer;
+    class Mailbox;
+    class V3D;
 
     class Kernel final : public Object<_cl_kernel, CL_INVALID_KERNEL>
     {
@@ -40,7 +43,7 @@ namespace vc4cl
             cl_uint num_events_in_wait_list, const cl_event* event_wait_list, cl_event* event);
 
         object_wrapper<Program> program;
-        KernelInfo info;
+        const KernelInfo info;
 
         std::vector<std::unique_ptr<KernelArgument>> args;
         std::bitset<kernel_config::MAX_PARAMETER_COUNT> argsSetMask;
@@ -56,6 +59,7 @@ namespace vc4cl
         virtual ~KernelArgument() noexcept;
 
         virtual std::string to_string() const = 0;
+        virtual std::unique_ptr<KernelArgument> clone() const = 0;
     };
 
     /**
@@ -81,8 +85,10 @@ namespace vc4cl
         void addScalar(float f);
         void addScalar(uint32_t u);
         void addScalar(int32_t s);
+        void addScalar(uint64_t l);
 
         std::string to_string() const override;
+        std::unique_ptr<KernelArgument> clone() const override;
     };
 
     /**
@@ -120,6 +126,7 @@ namespace vc4cl
         std::vector<uint8_t> data;
 
         std::string to_string() const override;
+        std::unique_ptr<KernelArgument> clone() const override;
     };
 
     /**
@@ -141,15 +148,32 @@ namespace vc4cl
         Buffer* buffer;
 
         std::string to_string() const override;
+        std::unique_ptr<KernelArgument> clone() const override;
     };
 
     struct KernelExecution final : public EventAction
     {
         object_wrapper<Kernel> kernel;
+        // Keep a reference to the mailbox to guarantee it still exists when we actually do the execution. This is
+        // mostly to gracefully handle application errors, e.g. when a kernel is executed and not waited for finished
+        // and then the application shuts down.
+        std::shared_ptr<Mailbox> mailbox;
+        // Keep a reference to the V3D instance for the same reason as for the Mailbox above.
+        std::shared_ptr<V3D> v3d;
         cl_uchar numDimensions;
         std::array<std::size_t, kernel_config::NUM_DIMENSIONS> globalOffsets;
         std::array<std::size_t, kernel_config::NUM_DIMENSIONS> globalSizes;
         std::array<std::size_t, kernel_config::NUM_DIMENSIONS> localSizes;
+
+        /**
+         * Tracks the state of the kernel arguments at the point this kernel execution event was created
+         * (clEnqueueNDRangeKernel was called).
+         *
+         * We need to take a snapshot of the arguments and their values at the point of queuing the kernel execution,
+         * since the arguments of the kernel object might be modified afterwards in preparation of executing the same
+         * kernel object again.
+         */
+        std::vector<std::unique_ptr<KernelArgument>> executionArguments;
 
         /**
          * Tracks temporary and preexisting device buffers to guarantee they exist until the kernel finishes
